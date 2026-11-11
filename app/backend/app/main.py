@@ -1,0 +1,2285 @@
+import json
+import httpx
+
+from fastapi.responses import StreamingResponse, FileResponse
+import os
+import sqlite3
+import uuid
+import subprocess
+import queue
+import threading
+import re
+import sys
+import shutil
+import hashlib
+import mimetypes
+
+from pathlib import Path
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+import pytesseract
+
+# Tesseract OCR configuration
+TESSERACT_EXE = os.environ.get(
+    "TESSERACT_CMD",
+    r"D:\Tesseract\tesseract.exe"
+)
+
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+
+os.environ["TESSDATA_PREFIX"] = os.environ.get(
+    "TESSDATA_PREFIX",
+    r"D:\Tesseract\tessdata"
+)
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+DATA_ROOT = Path(
+    os.environ.get("LOCAL_AI_HOME", r"D:\LocalAIStudio\data")
+)
+
+DB_DIR = DATA_ROOT / "database"
+DB_PATH = DB_DIR / "local_ai.db"
+
+STORAGE_DIRS = [
+    "users", "conversations", "projects",
+    "documents", "images", "generated",
+    "thumbnails", "indexes"
+]
+
+LLAMA_CPP_URL = os.environ.get(
+    "LLAMA_CPP_URL",
+    "http://127.0.0.1:8081"
+)
+
+# Set this to the friendly name of the model currently loaded in llama.cpp.
+# Example: $env:LOCAL_AI_MODEL_NAME = "Mistral 7B"
+MODEL_NAME = os.environ.get("LOCAL_AI_MODEL_NAME", "Mistral")
+
+# Active coding workspace is held in memory for this app session.
+# Phase 6.1 is intentionally read-only; no file-write or command execution routes exist.
+ACTIVE_CODING_WORKSPACE: Path | None = None
+CODING_IGNORED_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    "dist", "build", "target", ".next", ".idea", ".vscode"
+}
+CODING_MAX_FILE_BYTES = 1_000_000
+CODING_TERMINAL_TIMEOUT = 120
+CODING_TERMINAL_MAX_OUTPUT = 200_000
+CODING_DEBUG_SESSIONS = {}
+CODING_DEBUG_LOCK = threading.Lock()
+
+def get_time():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_connection():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+# --------------------------------------------------
+# DATABASE INITIALIZATION
+# --------------------------------------------------
+
+def initialize_storage():
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+
+    for folder in STORAGE_DIRS:
+        (DATA_ROOT / folder).mkdir(parents=True, exist_ok=True)
+
+    with get_connection() as db:
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                id INTEGER PRIMARY KEY,
+                app_version TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
+            INSERT INTO app_metadata (id, app_version)
+            VALUES (1, '0.2.0')
+            ON CONFLICT(id) DO NOTHING
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT 'New Chat',
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY (conversation_id)
+                REFERENCES conversations(id)
+                ON DELETE CASCADE
+            )
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation
+            ON messages(conversation_id, created_at)
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated
+            ON conversations(is_deleted, updated_at)
+        """)
+
+        # Safe, additive migrations for databases created by earlier versions.
+        message_columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "model_name" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN model_name TEXT")
+        if "feedback" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN feedback TEXT")
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS message_projects (
+                message_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (message_id, project_id),
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                original_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL UNIQUE,
+                file_type TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                uploaded_at TEXT NOT NULL
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_documents_uploaded ON documents(uploaded_at DESC)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS document_materials (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                material_type TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_document_materials_doc ON document_materials(document_id, created_at DESC)")
+        # SQLite FTS5 provides a persistent local lexical retrieval index for document RAG.
+        db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS document_passages_fts
+                      USING fts5(document_id UNINDEXED, page UNINDEXED, content, tokenize='unicode61')""")
+        document_columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)").fetchall()}
+        for column, definition in {
+            "extracted_text": "TEXT NOT NULL DEFAULT ''",
+            "extraction_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "page_count": "INTEGER",
+            "extracted_at": "TEXT",
+            "extraction_error": "TEXT"
+        }.items():
+            if column not in document_columns:
+                db.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS coding_file_versions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                content BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'save'
+            )
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_coding_versions_file
+            ON coding_file_versions(workspace_path, relative_path, created_at DESC)
+        """)
+
+
+# --------------------------------------------------
+# REQUEST SCHEMAS
+# --------------------------------------------------
+
+class ConversationCreate(BaseModel):
+    title: str = Field(default="New Chat", min_length=1, max_length=150)
+
+
+class ConversationRename(BaseModel):
+    title: str = Field(min_length=1, max_length=150)
+
+
+class PinUpdate(BaseModel):
+    is_pinned: bool
+
+
+class MessageCreate(BaseModel):
+    role: str = Field(default="user")
+    content: str = Field(min_length=1, max_length=100000)
+
+class ChatRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100000)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=512, ge=1, le=2048)
+
+
+class FeedbackCreate(BaseModel):
+    rating: str = Field(pattern="^(good|bad)$")
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2000)
+
+
+class CodingWorkspaceSelect(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+# --------------------------------------------------
+# FASTAPI APPLICATION
+# --------------------------------------------------
+
+class DocumentImportPath(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    initialize_storage()
+    yield
+
+
+app = FastAPI(
+    title="Local AI Studio",
+    version="0.2.0",
+    description="Local AI Studio Chat Management API",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "tauri://localhost",
+        "http://tauri.localhost"
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+# --------------------------------------------------
+# HEALTH AND STORAGE
+# --------------------------------------------------
+
+@app.get("/")
+def root():
+    return {
+        "application": "Local AI Studio",
+        "status": "operational"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "application": "Local AI Studio",
+        "version": "0.2.0",
+        "status": "running",
+        "database_exists": DB_PATH.exists()
+    }
+
+
+@app.get("/system/storage")
+def storage_status():
+    return {
+        "storage_directory": str(DATA_ROOT),
+        "database": str(DB_PATH),
+        "database_exists": DB_PATH.exists()
+    }
+
+
+# --------------------------------------------------
+# CREATE CONVERSATION
+# --------------------------------------------------
+
+@app.post("/conversations")
+def create_conversation(data: ConversationCreate):
+
+    conversation_id = str(uuid.uuid4())
+    now = get_time()
+
+    with get_connection() as db:
+        db.execute("""
+            INSERT INTO conversations (
+                id, title, is_pinned, is_deleted,
+                created_at, updated_at
+            )
+            VALUES (?, ?, 0, 0, ?, ?)
+        """, (
+            conversation_id,
+            data.title.strip(),
+            now,
+            now
+        ))
+
+        result = db.execute("""
+            SELECT * FROM conversations WHERE id = ?
+        """, (conversation_id,)).fetchone()
+
+    return dict(result)
+
+
+# --------------------------------------------------
+# LIST CONVERSATIONS
+# --------------------------------------------------
+
+@app.get("/conversations")
+def list_conversations(
+    include_trash: bool = False
+):
+
+    with get_connection() as db:
+
+        if include_trash:
+            rows = db.execute("""
+                SELECT * FROM conversations
+                WHERE is_deleted = 1
+                ORDER BY deleted_at DESC
+            """).fetchall()
+
+        else:
+            rows = db.execute("""
+                SELECT * FROM conversations
+                WHERE is_deleted = 0
+                ORDER BY is_pinned DESC, updated_at DESC
+            """).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+# --------------------------------------------------
+# SEARCH CONVERSATIONS AND MESSAGES
+# --------------------------------------------------
+
+@app.get("/conversations/search")
+def search_conversations(q: str = Query(min_length=1)):
+
+    search_term = f"%{q.strip()}%"
+
+    with get_connection() as db:
+
+        rows = db.execute("""
+            SELECT DISTINCT c.*
+            FROM conversations c
+            LEFT JOIN messages m
+                ON c.id = m.conversation_id
+            WHERE c.is_deleted = 0
+              AND (
+                c.title LIKE ?
+                OR m.content LIKE ?
+              )
+            ORDER BY c.is_pinned DESC, c.updated_at DESC
+        """, (search_term, search_term)).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+# --------------------------------------------------
+# RENAME CONVERSATION
+# --------------------------------------------------
+
+@app.patch("/conversations/{conversation_id}")
+def rename_conversation(
+    conversation_id: str,
+    data: ConversationRename
+):
+
+    with get_connection() as db:
+
+        cursor = db.execute("""
+            UPDATE conversations
+            SET title = ?, updated_at = ?
+            WHERE id = ? AND is_deleted = 0
+        """, (
+            data.title.strip(),
+            get_time(),
+            conversation_id
+        ))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+
+        result = db.execute("""
+            SELECT * FROM conversations WHERE id = ?
+        """, (conversation_id,)).fetchone()
+
+    return dict(result)
+
+
+# --------------------------------------------------
+# PIN / UNPIN CONVERSATION
+# --------------------------------------------------
+
+@app.patch("/conversations/{conversation_id}/pin")
+def pin_conversation(
+    conversation_id: str,
+    data: PinUpdate
+):
+
+    with get_connection() as db:
+
+        cursor = db.execute("""
+            UPDATE conversations
+            SET is_pinned = ?, updated_at = ?
+            WHERE id = ? AND is_deleted = 0
+        """, (
+            int(data.is_pinned),
+            get_time(),
+            conversation_id
+        ))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+
+        result = db.execute("""
+            SELECT * FROM conversations WHERE id = ?
+        """, (conversation_id,)).fetchone()
+
+    return dict(result)
+
+
+# --------------------------------------------------
+# MOVE TO TRASH
+# --------------------------------------------------
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str):
+
+    with get_connection() as db:
+
+        cursor = db.execute("""
+            UPDATE conversations
+            SET is_deleted = 1,
+                is_pinned = 0,
+                deleted_at = ?,
+                updated_at = ?
+            WHERE id = ? AND is_deleted = 0
+        """, (
+            get_time(),
+            get_time(),
+            conversation_id
+        ))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+
+    return {"message": "Conversation moved to trash"}
+
+
+# --------------------------------------------------
+# RESTORE FROM TRASH
+# --------------------------------------------------
+
+@app.post("/conversations/{conversation_id}/restore")
+def restore_conversation(conversation_id: str):
+
+    with get_connection() as db:
+
+        cursor = db.execute("""
+            UPDATE conversations
+            SET is_deleted = 0,
+                deleted_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND is_deleted = 1
+        """, (
+            get_time(),
+            conversation_id
+        ))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Deleted conversation not found")
+
+    return {"message": "Conversation restored"}
+
+
+# --------------------------------------------------
+# PERMANENTLY DELETE
+# --------------------------------------------------
+
+@app.delete("/conversations/{conversation_id}/permanent")
+def permanently_delete_conversation(conversation_id: str):
+
+    with get_connection() as db:
+
+        cursor = db.execute("""
+            DELETE FROM conversations
+            WHERE id = ? AND is_deleted = 1
+        """, (conversation_id,))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Deleted conversation not found")
+
+    return {"message": "Conversation permanently deleted"}
+
+
+# --------------------------------------------------
+# ADD MESSAGE
+# --------------------------------------------------
+
+@app.post("/conversations/{conversation_id}/messages")
+def add_message(
+    conversation_id: str,
+    data: MessageCreate
+):
+
+    if data.role not in ("user", "assistant", "system"):
+        raise HTTPException(400, "Invalid message role")
+
+    content = data.content.strip()
+
+    if not content:
+        raise HTTPException(400, "Message cannot be empty")
+
+    message_id = str(uuid.uuid4())
+    now = get_time()
+
+    with get_connection() as db:
+
+        conversation = db.execute("""
+            SELECT * FROM conversations
+            WHERE id = ? AND is_deleted = 0
+        """, (conversation_id,)).fetchone()
+
+        if not conversation:
+            raise HTTPException(404, "Conversation not found")
+
+        db.execute("""
+            INSERT INTO messages (
+                id, conversation_id, role, content, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            message_id,
+            conversation_id,
+            data.role,
+            content,
+            now
+        ))
+
+        title = conversation["title"]
+
+        if data.role == "user" and title == "New Chat":
+            title = content[:50]
+
+            db.execute("""
+                UPDATE conversations
+                SET title = ?, updated_at = ?
+                WHERE id = ?
+            """, (title, now, conversation_id))
+
+        else:
+            db.execute("""
+                UPDATE conversations
+                SET updated_at = ?
+                WHERE id = ?
+            """, (now, conversation_id))
+
+        result = db.execute("""
+            SELECT * FROM messages WHERE id = ?
+        """, (message_id,)).fetchone()
+
+    return dict(result)
+
+
+# --------------------------------------------------
+# GET CONVERSATION MESSAGES
+# --------------------------------------------------
+
+@app.get("/conversations/{conversation_id}/messages")
+def get_messages(conversation_id: str):
+
+    with get_connection() as db:
+
+        conversation = db.execute("""
+            SELECT id FROM conversations
+            WHERE id = ? AND is_deleted = 0
+        """, (conversation_id,)).fetchone()
+
+        if not conversation:
+            raise HTTPException(404, "Conversation not found")
+
+        rows = db.execute("""
+            SELECT * FROM messages
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC, rowid ASC
+        """, (conversation_id,)).fetchall()
+
+    return [dict(row) for row in rows]
+
+# --------------------------------------------------
+# AI CHAT - STREAMING LLAMA.CPP
+# --------------------------------------------------
+
+@app.post("/conversations/{conversation_id}/chat/stream")
+async def stream_chat(
+    conversation_id: str,
+    data: ChatRequest
+):
+    user_content = data.content.strip()
+
+    if not user_content:
+        raise HTTPException(400, "Message cannot be empty")
+
+    user_message_id = str(uuid.uuid4())
+    now = get_time()
+
+    # Save user message and retrieve conversation history
+    with get_connection() as db:
+
+        conversation = db.execute("""
+            SELECT * FROM conversations
+            WHERE id = ? AND is_deleted = 0
+        """, (conversation_id,)).fetchone()
+
+        if not conversation:
+            raise HTTPException(404, "Conversation not found")
+
+        db.execute("""
+            INSERT INTO messages (
+                id, conversation_id, role, content, created_at
+            )
+            VALUES (?, ?, 'user', ?, ?)
+        """, (
+            user_message_id,
+            conversation_id,
+            user_content,
+            now
+        ))
+
+        if conversation["title"] == "New Chat":
+            db.execute("""
+                UPDATE conversations
+                SET title = ?, updated_at = ?
+                WHERE id = ?
+            """, (
+                user_content[:50],
+                now,
+                conversation_id
+            ))
+        else:
+            db.execute("""
+                UPDATE conversations
+                SET updated_at = ?
+                WHERE id = ?
+            """, (now, conversation_id))
+
+        rows = db.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC, rowid ASC
+        """, (conversation_id,)).fetchall()
+
+        messages = [
+            {
+                "role": row["role"],
+                "content": row["content"]
+            }
+            for row in rows
+        ]
+
+    async def generate():
+
+        assistant_content = ""
+
+        payload = {
+            "messages": messages,
+            "temperature": data.temperature,
+            "max_tokens": data.max_tokens,
+            "stream": True
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+
+                async with client.stream(
+                    "POST",
+                    f"{LLAMA_CPP_URL}/v1/chat/completions",
+                    json=payload
+                ) as response:
+
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+
+                        yield (
+                            "data: " +
+                            json.dumps({
+                                "error": error_body.decode(
+                                    "utf-8",
+                                    errors="replace"
+                                )
+                            }) +
+                            "\n\n"
+                        )
+                        return
+
+                    async for line in response.aiter_lines():
+
+                        if not line.startswith("data:"):
+                            continue
+
+                        chunk = line[5:].strip()
+
+                        if chunk == "[DONE]":
+                            break
+
+                        try:
+                            parsed = json.loads(chunk)
+
+                            delta = (
+                                parsed.get("choices", [{}])[0]
+                                .get("delta", {})
+                            )
+
+                            token = delta.get("content", "")
+
+                            if token:
+                                assistant_content += token
+
+                                yield (
+                                    "data: " +
+                                    json.dumps({
+                                        "token": token
+                                    }) +
+                                    "\n\n"
+                                )
+
+                        except json.JSONDecodeError:
+                            continue
+
+            # Save completed assistant response
+            if assistant_content.strip():
+
+                assistant_id = str(uuid.uuid4())
+
+                with get_connection() as db:
+
+                    db.execute("""
+                        INSERT INTO messages (
+                            id, conversation_id,
+                            role, content, created_at, model_name
+                        )
+                        VALUES (?, ?, 'assistant', ?, ?, ?)
+                    """, (
+                        assistant_id,
+                        conversation_id,
+                        assistant_content,
+                        get_time(),
+                        MODEL_NAME
+                    ))
+
+                    db.execute("""
+                        UPDATE conversations
+                        SET updated_at = ?
+                        WHERE id = ?
+                    """, (
+                        get_time(),
+                        conversation_id
+                    ))
+
+            yield "data: [DONE]\n\n"
+
+        except httpx.RequestError as exc:
+
+            yield (
+                "data: " +
+                json.dumps({
+                    "error": f"Could not connect to llama.cpp: {str(exc)}"
+                }) +
+                "\n\n"
+            )
+
+        except Exception as exc:
+
+            yield (
+                "data: " +
+                json.dumps({
+                    "error": str(exc)
+                }) +
+                "\n\n"
+            )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+# --------------------------------------------------
+# CODING WORKSPACE - PHASE 6.1 (READ-ONLY)
+# --------------------------------------------------
+
+def get_active_coding_workspace() -> Path:
+    if ACTIVE_CODING_WORKSPACE is None:
+        raise HTTPException(400, "Select a coding project folder first")
+    root = ACTIVE_CODING_WORKSPACE.resolve()
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(404, "The selected coding workspace no longer exists")
+    return root
+
+
+def resolve_workspace_path(relative_path: str) -> Path:
+    root = get_active_coding_workspace()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise HTTPException(403, "Access outside the selected workspace is not allowed")
+    # Reject symlink traversal, including symlinks that resolve back inside the root.
+    current = root
+    for part in Path(relative_path).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise HTTPException(403, "Parent-directory traversal is not allowed")
+        current = current / part
+        if current.is_symlink():
+            raise HTTPException(403, "Symbolic links are not allowed in the coding workspace")
+    return candidate
+
+
+@app.post("/coding/workspace/select")
+def select_coding_workspace(data: CodingWorkspaceSelect):
+    global ACTIVE_CODING_WORKSPACE
+    raw_path = Path(data.path).expanduser()
+    try:
+        selected = raw_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(400, "The selected folder could not be accessed")
+    if not selected.exists() or not selected.is_dir():
+        raise HTTPException(400, "Please select an existing folder")
+    ACTIVE_CODING_WORKSPACE = selected
+    return {"selected": True, "path": str(selected), "name": selected.name or str(selected)}
+
+
+@app.get("/coding/workspace")
+def coding_workspace_status():
+    if ACTIVE_CODING_WORKSPACE is None:
+        return {"selected": False, "path": None, "name": None}
+    root = ACTIVE_CODING_WORKSPACE
+    if not root.exists() or not root.is_dir():
+        return {"selected": False, "path": None, "name": None}
+    return {"selected": True, "path": str(root), "name": root.name or str(root)}
+
+
+@app.get("/coding/workspace/files")
+def list_coding_workspace_files(relative_path: str = Query(default="", max_length=4096)):
+    folder = resolve_workspace_path(relative_path)
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPException(404, "Folder not found in the selected workspace")
+    entries = []
+    try:
+        children = sorted(folder.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+        for item in children:
+            if item.is_symlink() or item.name in CODING_IGNORED_DIRS or item.name.startswith("."):
+                continue
+            try:
+                if item.is_dir():
+                    entries.append({
+                        "name": item.name,
+                        "relative_path": item.relative_to(get_active_coding_workspace()).as_posix(),
+                        "type": "directory",
+                        "size": None
+                    })
+                elif item.is_file():
+                    entries.append({
+                        "name": item.name,
+                        "relative_path": item.relative_to(get_active_coding_workspace()).as_posix(),
+                        "type": "file",
+                        "size": item.stat().st_size
+                    })
+            except OSError:
+                continue
+            if len(entries) >= 500:
+                break
+    except OSError:
+        raise HTTPException(403, "Unable to list this folder")
+    return entries
+
+
+@app.get("/coding/workspace/read")
+def read_coding_workspace_file(relative_path: str = Query(min_length=1, max_length=4096)):
+    file_path = resolve_workspace_path(relative_path)
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(404, "File not found in the selected workspace")
+    try:
+        size = file_path.stat().st_size
+        if size > CODING_MAX_FILE_BYTES:
+            raise HTTPException(413, "File is larger than the 1 MB preview limit")
+        raw = file_path.read_bytes()
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(403, "Unable to read this file")
+    if b"\\x00" in raw:
+        raise HTTPException(415, "Binary files cannot be previewed as text")
+    try:
+        content = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(415, "This file is not valid UTF-8 text")
+    return {
+        "name": file_path.name,
+        "relative_path": relative_path,
+        "size": size,
+        "content": content
+    }
+
+
+class CodingFileWrite(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=4096)
+    content: str = Field(max_length=1_000_000)
+
+class CodingPathCreate(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=4096)
+    kind: str = Field(pattern="^(file|folder)$")
+
+class CodingPathRename(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=4096)
+    new_name: str = Field(min_length=1, max_length=255)
+
+class CodingPathDelete(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=4096)
+
+
+def validate_new_name(name: str):
+    if name in (".", "..") or any(ch in name for ch in ('/', '\\', ':')) or name.strip() != name:
+        raise HTTPException(400, "Enter a valid file or folder name")
+    if any(ord(ch) < 32 for ch in name):
+        raise HTTPException(400, "The name contains invalid characters")
+
+
+def create_coding_version(target: Path, relative_path: str, reason: str = "save") -> str | None:
+    """Persist a pre-change snapshot in the app database, outside the project."""
+    if not target.exists() or not target.is_file():
+        return None
+    raw = target.read_bytes()
+    if len(raw) > CODING_MAX_FILE_BYTES:
+        raise HTTPException(413, "File exceeds the version-history limit")
+    version_id = str(uuid.uuid4())
+    with get_connection() as db:
+        db.execute("""
+            INSERT INTO coding_file_versions
+                (id, workspace_path, relative_path, content, size, created_at, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (version_id, str(get_active_coding_workspace()), relative_path, raw, len(raw), get_time(), reason))
+    return version_id
+
+
+class CodingVersionRestore(BaseModel):
+    version_id: str = Field(min_length=1, max_length=64)
+
+class CodingTerminalRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=4000)
+    relative_path: str = Field(default="", max_length=4096)
+    approved: bool = False
+    timeout: int = Field(default=30, ge=1, le=CODING_TERMINAL_TIMEOUT)
+
+class CodingDebugStart(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=4096)
+    approved: bool = False
+
+class CodingDebugCommand(BaseModel):
+    command: str = Field(min_length=1, max_length=500)
+
+
+def _workspace_cwd(relative_path: str = "") -> Path:
+    cwd = resolve_workspace_path(relative_path)
+    if not cwd.exists() or not cwd.is_dir():
+        raise HTTPException(400, "Terminal working directory must be an existing folder")
+    return cwd
+
+
+@app.put("/coding/workspace/write")
+def write_coding_workspace_file(data: CodingFileWrite):
+    target = resolve_workspace_path(data.relative_path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "File not found")
+    if target.stat().st_size > CODING_MAX_FILE_BYTES:
+        raise HTTPException(413, "File exceeds the 1 MB editing limit")
+    if target.suffix.lower() in {".exe", ".dll", ".so", ".bin", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".7z", ".db", ".sqlite"}:
+        raise HTTPException(415, "This file type is not supported by the text editor")
+    try:
+        # Persist a queryable version before every overwrite (including approved diffs).
+        create_coding_version(target, data.relative_path, "save")
+        # Keep a timestamped raw safety copy outside the selected project as well.
+        backup_dir = DATA_ROOT / "coding_backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        backup_name = f"{stamp}_{uuid.uuid4().hex}_{target.name}.bak"
+        backup_path = backup_dir / backup_name
+        backup_path.write_bytes(target.read_bytes())
+        target.write_text(data.content, encoding="utf-8", newline="")
+    except OSError:
+        raise HTTPException(403, "Unable to save the file or create its safety backup")
+    return {"saved": True, "relative_path": data.relative_path, "size": target.stat().st_size, "backup_created": True}
+
+
+@app.post("/coding/workspace/create")
+def create_coding_workspace_path(data: CodingPathCreate):
+    target = resolve_workspace_path(data.relative_path)
+    if target.exists():
+        raise HTTPException(409, "A file or folder with this name already exists")
+    if target.parent != target.parent.resolve() or not target.parent.exists() or not target.parent.is_dir():
+        raise HTTPException(400, "Parent folder does not exist")
+    if data.kind == "folder":
+        target.mkdir()
+    else:
+        target.parent.mkdir(parents=False, exist_ok=True)
+        target.touch(exist_ok=False)
+    return {"created": True, "relative_path": data.relative_path, "kind": data.kind}
+
+
+@app.post("/coding/workspace/rename")
+def rename_coding_workspace_path(data: CodingPathRename):
+    source = resolve_workspace_path(data.relative_path)
+    validate_new_name(data.new_name)
+    if not source.exists():
+        raise HTTPException(404, "File or folder not found")
+    destination = resolve_workspace_path(str(Path(data.relative_path).parent / data.new_name))
+    if destination.exists():
+        raise HTTPException(409, "An item with that name already exists")
+    try:
+        source.rename(destination)
+    except OSError:
+        raise HTTPException(403, "Unable to rename this item")
+    return {"renamed": True, "relative_path": str(Path(data.relative_path).parent / data.new_name)}
+
+
+@app.post("/coding/workspace/delete")
+def delete_coding_workspace_path(data: CodingPathDelete):
+    target = resolve_workspace_path(data.relative_path)
+    root = get_active_coding_workspace()
+    if target == root:
+        raise HTTPException(403, "The selected workspace root cannot be deleted")
+    if not target.exists():
+        raise HTTPException(404, "File or folder not found")
+    try:
+        if target.is_dir():
+            import shutil
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    except OSError:
+        raise HTTPException(403, "Unable to delete this item")
+    return {"deleted": True, "relative_path": data.relative_path}
+
+
+# --------------------------------------------------
+# MODEL INFORMATION
+# --------------------------------------------------
+
+@app.get("/system/model")
+async def current_model():
+    """Return configured model name and, when available, llama.cpp model details."""
+    model_id = None
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{LLAMA_CPP_URL}/v1/models")
+            if response.status_code == 200:
+                payload = response.json()
+                model_items = payload.get("data", [])
+                if model_items:
+                    model_id = model_items[0].get("id")
+    except (httpx.RequestError, ValueError):
+        pass
+
+    return {
+        "name": MODEL_NAME,
+        "model_id": model_id,
+        "runtime": "llama.cpp",
+        "available": model_id is not None
+    }
+
+
+# --------------------------------------------------
+# MESSAGE FEEDBACK
+# --------------------------------------------------
+
+@app.post("/messages/{message_id}/feedback")
+def save_message_feedback(message_id: str, data: FeedbackCreate):
+    with get_connection() as db:
+        cursor = db.execute("""
+            UPDATE messages
+            SET feedback = ?
+            WHERE id = ? AND role = 'assistant'
+        """, (data.rating, message_id))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Assistant message not found")
+
+        row = db.execute("""
+            SELECT id, feedback FROM messages WHERE id = ?
+        """, (message_id,)).fetchone()
+
+    return dict(row)
+
+
+@app.delete("/messages/{message_id}/feedback")
+def clear_message_feedback(message_id: str):
+    with get_connection() as db:
+        cursor = db.execute("""
+            UPDATE messages
+            SET feedback = NULL
+            WHERE id = ? AND role = 'assistant'
+        """, (message_id,))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Assistant message not found")
+
+    return {"message": "Feedback cleared"}
+
+
+# --------------------------------------------------
+# PROJECTS
+# --------------------------------------------------
+
+@app.post("/projects")
+def create_project(data: ProjectCreate):
+    project_id = str(uuid.uuid4())
+    now = get_time()
+    name = data.name.strip()
+
+    if not name:
+        raise HTTPException(400, "Project name cannot be empty")
+
+    with get_connection() as db:
+        db.execute("""
+            INSERT INTO projects (id, name, description, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (project_id, name, data.description.strip(), now, now))
+        row = db.execute(
+            "SELECT * FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+
+    return dict(row)
+
+
+@app.get("/projects")
+def list_projects():
+    with get_connection() as db:
+        rows = db.execute("""
+            SELECT p.*,
+                   COUNT(mp.message_id) AS message_count
+            FROM projects p
+            LEFT JOIN message_projects mp ON mp.project_id = p.id
+            GROUP BY p.id
+            ORDER BY p.updated_at DESC
+        """).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+@app.post("/messages/{message_id}/projects/{project_id}")
+def add_message_to_project(message_id: str, project_id: str):
+    now = get_time()
+
+    with get_connection() as db:
+        message = db.execute("""
+            SELECT id FROM messages
+            WHERE id = ? AND role = 'assistant'
+        """, (message_id,)).fetchone()
+
+        if not message:
+            raise HTTPException(404, "Assistant message not found")
+
+        project = db.execute("""
+            SELECT id FROM projects WHERE id = ?
+        """, (project_id,)).fetchone()
+
+        if not project:
+            raise HTTPException(404, "Project not found")
+
+        db.execute("""
+            INSERT OR IGNORE INTO message_projects
+                (message_id, project_id, created_at)
+            VALUES (?, ?, ?)
+        """, (message_id, project_id, now))
+
+        db.execute("""
+            UPDATE projects SET updated_at = ? WHERE id = ?
+        """, (now, project_id))
+
+    return {
+        "message": "Assistant response added to project",
+        "message_id": message_id,
+        "project_id": project_id
+    }
+
+
+@app.get("/projects/{project_id}/messages")
+def get_project_messages(project_id: str):
+    with get_connection() as db:
+        project = db.execute(
+            "SELECT id FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+
+        if not project:
+            raise HTTPException(404, "Project not found")
+
+        rows = db.execute("""
+            SELECT m.*
+            FROM messages m
+            INNER JOIN message_projects mp ON mp.message_id = m.id
+            WHERE mp.project_id = ?
+            ORDER BY mp.created_at DESC
+        """, (project_id,)).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+@app.delete("/messages/{message_id}/projects/{project_id}")
+def remove_message_from_project(message_id: str, project_id: str):
+    with get_connection() as db:
+        cursor = db.execute("""
+            DELETE FROM message_projects
+            WHERE message_id = ? AND project_id = ?
+        """, (message_id, project_id))
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Project association not found")
+
+    return {"message": "Assistant response removed from project"}
+
+
+# --------------------------------------------------
+# REGENERATE AN EXISTING ASSISTANT RESPONSE
+# --------------------------------------------------
+
+@app.post(
+    "/conversations/{conversation_id}/messages/{assistant_message_id}/regenerate/stream"
+)
+async def regenerate_assistant_response(
+    conversation_id: str,
+    assistant_message_id: str,
+    data: ChatRequest
+):
+    """
+    Regenerate an existing assistant message using the user prompt immediately
+    preceding it. This does not insert another user message or assistant row.
+    """
+    with get_connection() as db:
+        conversation = db.execute("""
+            SELECT id FROM conversations
+            WHERE id = ? AND is_deleted = 0
+        """, (conversation_id,)).fetchone()
+
+        if not conversation:
+            raise HTTPException(404, "Conversation not found")
+
+        target = db.execute("""
+            SELECT rowid, id FROM messages
+            WHERE id = ? AND conversation_id = ? AND role = 'assistant'
+        """, (assistant_message_id, conversation_id)).fetchone()
+
+        if not target:
+            raise HTTPException(404, "Assistant message not found")
+
+        preceding_user = db.execute("""
+            SELECT rowid, id
+            FROM messages
+            WHERE conversation_id = ? AND role = 'user' AND rowid < ?
+            ORDER BY rowid DESC
+            LIMIT 1
+        """, (conversation_id, target["rowid"])).fetchone()
+
+        if not preceding_user:
+            raise HTTPException(400, "No preceding user prompt found")
+
+        history_rows = db.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE conversation_id = ? AND rowid <= ?
+              AND role IN ('user', 'assistant', 'system')
+            ORDER BY rowid ASC
+        """, (conversation_id, preceding_user["rowid"])).fetchall()
+
+        history = [
+            {"role": row["role"], "content": row["content"]}
+            for row in history_rows
+        ]
+
+    async def generate():
+        assistant_content = ""
+        payload = {
+            "messages": history,
+            "temperature": data.temperature,
+            "max_tokens": data.max_tokens,
+            "stream": True
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "POST",
+                    f"{LLAMA_CPP_URL}/v1/chat/completions",
+                    json=payload
+                ) as response:
+                    if response.status_code != 200:
+                        body = await response.aread()
+                        yield "data: " + json.dumps({
+                            "error": body.decode("utf-8", errors="replace")
+                        }) + "\n\n"
+                        return
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+
+                        chunk = line[5:].strip()
+                        if chunk == "[DONE]":
+                            break
+
+                        try:
+                            parsed = json.loads(chunk)
+                            delta = parsed.get("choices", [{}])[0].get("delta", {})
+                            token = delta.get("content", "")
+                            if token:
+                                assistant_content += token
+                                yield "data: " + json.dumps({"token": token}) + "\n\n"
+                        except (json.JSONDecodeError, IndexError, AttributeError):
+                            continue
+
+            if assistant_content.strip():
+                with get_connection() as db:
+                    db.execute("""
+                        UPDATE messages
+                        SET content = ?, created_at = ?, model_name = ?, feedback = NULL
+                        WHERE id = ? AND conversation_id = ?
+                    """, (
+                        assistant_content,
+                        get_time(),
+                        MODEL_NAME,
+                        assistant_message_id,
+                        conversation_id
+                    ))
+                    db.execute("""
+                        UPDATE conversations SET updated_at = ? WHERE id = ?
+                    """, (get_time(), conversation_id))
+
+            yield "data: [DONE]\n\n"
+
+        except httpx.RequestError as exc:
+            yield "data: " + json.dumps({
+                "error": f"Could not connect to llama.cpp: {str(exc)}"
+            }) + "\n\n"
+        except Exception as exc:
+            yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+# --------------------------------------------------
+# CODING WORKSPACE - PHASES 6.7 / 6.8 / 6.9
+# --------------------------------------------------
+
+@app.get("/coding/workspace/versions")
+def list_coding_file_versions(relative_path: str = Query(min_length=1, max_length=4096)):
+    resolve_workspace_path(relative_path)
+    root = str(get_active_coding_workspace())
+    with get_connection() as db:
+        rows = db.execute("""
+            SELECT id, relative_path, size, created_at, reason
+            FROM coding_file_versions
+            WHERE workspace_path = ? AND relative_path = ?
+            ORDER BY created_at DESC
+            LIMIT 100
+        """, (root, relative_path)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/coding/workspace/versions/{version_id}")
+def read_coding_file_version(version_id: str, relative_path: str = Query(min_length=1, max_length=4096)):
+    resolve_workspace_path(relative_path)
+    with get_connection() as db:
+        row = db.execute("""
+            SELECT id, relative_path, content, size, created_at, reason
+            FROM coding_file_versions
+            WHERE id = ? AND workspace_path = ? AND relative_path = ?
+        """, (version_id, str(get_active_coding_workspace()), relative_path)).fetchone()
+    if not row:
+        raise HTTPException(404, "File version not found")
+    try:
+        content = bytes(row["content"]).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(415, "This saved version is not valid UTF-8 text")
+    return {"id": row["id"], "relative_path": row["relative_path"], "content": content,
+            "size": row["size"], "created_at": row["created_at"], "reason": row["reason"]}
+
+
+@app.post("/coding/workspace/versions/{version_id}/restore")
+def restore_coding_file_version(version_id: str, data: CodingVersionRestore):
+    # The URL and body IDs must agree; this prevents accidental stale UI actions.
+    if data.version_id != version_id:
+        raise HTTPException(400, "Version identifier mismatch")
+    row = read_version_row(version_id)
+    target = resolve_workspace_path(row["relative_path"])
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "The current file no longer exists; restore is limited to existing files")
+    if target.stat().st_size > CODING_MAX_FILE_BYTES:
+        raise HTTPException(413, "Current file exceeds the restore limit")
+    create_coding_version(target, row["relative_path"], "before-restore")
+    try:
+        target.write_bytes(bytes(row["content"]))
+    except OSError:
+        raise HTTPException(403, "Unable to restore this file version")
+    return {"restored": True, "relative_path": row["relative_path"], "size": target.stat().st_size}
+
+
+def read_version_row(version_id: str):
+    with get_connection() as db:
+        row = db.execute("""
+            SELECT * FROM coding_file_versions
+            WHERE id = ? AND workspace_path = ?
+        """, (version_id, str(get_active_coding_workspace()))).fetchone()
+    if not row:
+        raise HTTPException(404, "File version not found")
+    return row
+
+
+@app.post("/coding/terminal/run")
+def run_coding_terminal(data: CodingTerminalRequest):
+    if not data.approved:
+        raise HTTPException(403, "Command execution requires explicit approval")
+    cwd = _workspace_cwd(data.relative_path)
+    command = data.command.strip()
+    # Block common destructive/system-wide operations. Project commands still require
+    # the user's explicit approval in the UI before this endpoint is called.
+    blocked = [r"(?i)\b(format|diskpart|shutdown|restart-computer|stop-computer)\b",
+              r"(?i)\b(remove-item|del|erase|rmdir|rd)\b[^\n]*(?:-recurse|/s|/q)",
+              r"(?i)\b(reg\s+(?:delete|add)|bcdedit|cipher\s+/w)\b"]
+    if any(re.search(pattern, command) for pattern in blocked):
+        raise HTTPException(403, "This potentially destructive command is blocked by the IDE safety policy")
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=str(cwd), capture_output=True, text=True, errors="replace",
+            timeout=data.timeout, shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        stdout = (completed.stdout or "")[-CODING_TERMINAL_MAX_OUTPUT:]
+        stderr = (completed.stderr or "")[-CODING_TERMINAL_MAX_OUTPUT:]
+        return {"exit_code": completed.returncode, "stdout": stdout, "stderr": stderr,
+                "timed_out": False, "working_directory": str(cwd)}
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return {"exit_code": None, "stdout": out[-CODING_TERMINAL_MAX_OUTPUT:],
+                "stderr": (err + "\nCommand timed out.")[-CODING_TERMINAL_MAX_OUTPUT:],
+                "timed_out": True, "working_directory": str(cwd)}
+    except OSError as exc:
+        raise HTTPException(500, f"Could not start terminal command: {exc}")
+
+
+@app.post("/coding/tests/run")
+def run_coding_tests(data: CodingTerminalRequest):
+    if not data.approved:
+        raise HTTPException(403, "Test execution requires explicit approval")
+    cwd = _workspace_cwd(data.relative_path)
+    # Only the supported test entry points are accepted; arbitrary shell text is not.
+    command = data.command.strip().lower()
+    if command not in ("pytest", "python -m pytest", "python -m unittest", "unittest"):
+        raise HTTPException(400, "Choose pytest or unittest; custom commands belong in the approved Terminal")
+    args = ([sys.executable, "-m", "pytest", "-q"] if command in ("pytest", "python -m pytest")
+            else [sys.executable, "-m", "unittest", "discover", "-v"])
+    try:
+        completed = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True,
+                                   errors="replace", timeout=data.timeout, shell=False,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return {"exit_code": completed.returncode, "stdout": (completed.stdout or "")[-CODING_TERMINAL_MAX_OUTPUT:],
+                "stderr": (completed.stderr or "")[-CODING_TERMINAL_MAX_OUTPUT:], "timed_out": False}
+    except subprocess.TimeoutExpired as exc:
+        return {"exit_code": None, "stdout": str(exc.stdout or ""),
+                "stderr": "Test run timed out.", "timed_out": True}
+
+
+@app.post("/coding/debug/start")
+def start_coding_debug(data: CodingDebugStart):
+    if not data.approved:
+        raise HTTPException(403, "Running a debug session requires explicit approval")
+    target = resolve_workspace_path(data.relative_path)
+    if not target.exists() or not target.is_file() or target.suffix.lower() != ".py":
+        raise HTTPException(400, "The debugger currently supports existing Python (.py) files")
+    cwd = target.parent
+    session_id = str(uuid.uuid4())
+    try:
+        # A small Pdb wrapper keeps stdin/stdout attached to pipes so the desktop
+        # UI can send debugger commands and display output without opening a console.
+        debugger_code = (
+            "import pdb, runpy, sys; "
+            "debugger = pdb.Pdb(stdin=sys.stdin, stdout=sys.stdout); "
+            "debugger.runcall(runpy.run_path, sys.argv[1], run_name='__main__')"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", debugger_code, str(target)], cwd=str(cwd),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    except OSError as exc:
+        raise HTTPException(500, f"Could not start Python debugger: {exc}")
+    output_queue = queue.Queue()
+    def pump():
+        try:
+            for line in process.stdout:
+                output_queue.put(line)
+        finally:
+            output_queue.put(None)
+    threading.Thread(target=pump, daemon=True).start()
+    with CODING_DEBUG_LOCK:
+        CODING_DEBUG_SESSIONS[session_id] = {"process": process, "queue": output_queue,
+                                             "relative_path": data.relative_path}
+    return {"session_id": session_id, "relative_path": data.relative_path,
+            "message": "Python debugger started. Use break <line>, next, step, continue, where, or p locals()."}
+
+
+@app.post("/coding/debug/{session_id}/command")
+def command_coding_debug(session_id: str, data: CodingDebugCommand):
+    with CODING_DEBUG_LOCK:
+        session = CODING_DEBUG_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(404, "Debug session not found")
+    process = session["process"]
+    if process.poll() is not None or process.stdin is None:
+        raise HTTPException(409, "Debug session has ended")
+    command = data.command.strip()
+    if not command or len(command) > 500:
+        raise HTTPException(400, "Invalid debugger command")
+    try:
+        process.stdin.write(command + "\n")
+        process.stdin.flush()
+    except (BrokenPipeError, OSError):
+        raise HTTPException(409, "Debugger input is no longer available")
+    return {"sent": True}
+
+
+@app.get("/coding/debug/{session_id}/output")
+def get_coding_debug_output(session_id: str):
+    with CODING_DEBUG_LOCK:
+        session = CODING_DEBUG_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(404, "Debug session not found")
+    lines = []
+    ended = False
+    q = session["queue"]
+    while len(lines) < 500:
+        try:
+            item = q.get_nowait()
+        except queue.Empty:
+            break
+        if item is None:
+            ended = True
+            break
+        lines.append(item)
+    process = session["process"]
+    if process.poll() is not None:
+        ended = True
+    return {"output": "".join(lines), "running": not ended, "exit_code": process.poll()}
+
+
+@app.delete("/coding/debug/{session_id}")
+def stop_coding_debug(session_id: str):
+    with CODING_DEBUG_LOCK:
+        session = CODING_DEBUG_SESSIONS.pop(session_id, None)
+    if not session:
+        raise HTTPException(404, "Debug session not found")
+    process = session["process"]
+    if process.poll() is None:
+        try:
+            process.stdin.write("q\n")
+            process.stdin.flush()
+            process.wait(timeout=2)
+        except Exception:
+            process.kill()
+    return {"stopped": True}
+
+
+# --------------------------------------------------
+# PHASE 7.1 — DOCUMENT UPLOAD AND MANAGEMENT
+# --------------------------------------------------
+
+DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+DOCUMENT_ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+DOCUMENTS_DIR = DATA_ROOT / "documents"
+
+
+def _document_row(row):
+    keys = set(row.keys())
+    return {
+        "id": row["id"], "filename": row["original_name"],
+        "file_type": row["file_type"], "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"], "sha256": row["sha256"],
+        "status": row["extraction_status"] if "extraction_status" in keys else row["status"],
+        "uploaded_at": row["uploaded_at"],
+        "page_count": row["page_count"] if "page_count" in keys else None,
+        "extracted_chars": len(row["extracted_text"] or "") if "extracted_text" in keys else 0,
+    }
+
+
+def _extract_document(path: Path):
+    extension = path.suffix.lower()
+    if extension == ".txt":
+        raw = path.read_bytes()
+        try:
+            return raw.decode("utf-8-sig"), None
+        except UnicodeDecodeError:
+            return raw.decode("cp1252", errors="replace"), None
+    if extension == ".docx":
+        from docx import Document
+        doc = Document(str(path))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table_index, table in enumerate(doc.tables, start=1):
+            parts.append(f"[Table {table_index}]")
+            parts.extend(" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows)
+        return "\n".join(parts), None
+    if extension == ".pdf":
+        from pypdf import PdfReader
+        reader = PdfReader(str(path), strict=False)
+        pages = [f"[Page {number}]\n{(page.extract_text() or '').strip()}" for number, page in enumerate(reader.pages, start=1)]
+        return "\n\n".join(pages).strip(), len(reader.pages)
+    raise ValueError("Unsupported document type.")
+
+
+def _process_document(document_id: str, stored_name: str):
+    try:
+        extracted_text, page_count = _extract_document(DOCUMENTS_DIR / stored_name)
+        searchable_text = re.sub(r"\[Page \d+\]", "", extracted_text).strip()
+        status = "extracted" if searchable_text else "needs_ocr"
+        with get_connection() as db:
+            db.execute(
+                """UPDATE documents SET extracted_text=?, extraction_status=?,
+                   page_count=?, extracted_at=?, extraction_error=NULL WHERE id=?""",
+                (extracted_text, status, page_count, get_time(), document_id)
+            )
+    except Exception as exc:
+        with get_connection() as db:
+            db.execute(
+                """UPDATE documents SET extraction_status='failed',
+                   extraction_error=?, extracted_at=? WHERE id=?""",
+                (str(exc)[:1000], get_time(), document_id)
+            )
+
+
+def _resolve_tesseract():
+    """Find a local Tesseract executable; no network access is used."""
+    configured = os.environ.get("TESSERACT_CMD")
+    candidates = [configured] if configured else []
+    found = shutil.which("tesseract")
+    if found:
+        candidates.append(found)
+    candidates.extend([
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"D:\Tesseract-OCR\tesseract.exe",
+        r"D:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"D:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ])
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate))
+    return None
+
+
+def _ocr_pdf(path: Path):
+    """OCR each page separately to keep memory use bounded on 16 GB systems."""
+    executable = _resolve_tesseract()
+    if not executable:
+        raise RuntimeError(
+            "Tesseract OCR was not found. Install the Tesseract OCR Windows application, "
+            "or set the TESSERACT_CMD environment variable to the full path of tesseract.exe, "
+            "then restart LOCAL AI STUDIO."
+        )
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR Python dependencies are missing. Install pymupdf, pytesseract and Pillow "
+            "in the LOCAL AI STUDIO backend virtual environment."
+        ) from exc
+    pytesseract.pytesseract.tesseract_cmd = executable
+    parts = []
+    with fitz.open(str(path)) as pdf:
+        total_pages = len(pdf)
+        if total_pages > 300:
+            raise RuntimeError("OCR is limited to 300 pages per document in this prototype.")
+        for page_number, page in enumerate(pdf, start=1):
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            text = pytesseract.image_to_string(image, lang="eng", config="--oem 1 --psm 3")
+            parts.append(f"[Page {page_number}]\n{text.strip()}")
+            del image, pix
+    return "\n\n".join(parts).strip(), total_pages
+
+
+def _store_document(source_path: Path, original_name: str, mime_type: str | None = None):
+    original_name = Path(original_name).name
+    extension = Path(original_name).suffix.lower()
+    if not original_name or extension not in DOCUMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX and TXT files are supported.")
+    if not source_path.is_file() or source_path.is_symlink():
+        raise HTTPException(status_code=400, detail="The selected path is not a regular file.")
+    total = source_path.stat().st_size
+    if total <= 0:
+        raise HTTPException(status_code=400, detail="The selected file is empty.")
+    if total > DOCUMENT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Document exceeds the 50 MB limit.")
+    document_id = str(uuid.uuid4())
+    stored_name = f"{document_id}{extension}"
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = DOCUMENTS_DIR / stored_name
+    digest = hashlib.sha256()
+    try:
+        with source_path.open("rb") as src, destination.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                dst.write(chunk)
+        uploaded_at = get_time()
+        detected_mime = mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream"
+        with get_connection() as db:
+            db.execute(
+                """INSERT INTO documents
+                (id, original_name, stored_name, file_type, mime_type, size_bytes, sha256, status, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', ?)""",
+                (document_id, original_name, stored_name, extension.lstrip(".").upper(),
+                 detected_mime, total, digest.hexdigest(), uploaded_at)
+            )
+        _process_document(document_id, stored_name)
+        with get_connection() as db:
+            row = db.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+        return _document_row(row)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        with get_connection() as db:
+            db.execute("DELETE FROM documents WHERE id=?", (document_id,))
+        raise
+
+
+@app.get("/documents")
+def list_documents():
+    with get_connection() as db:
+        rows = db.execute("SELECT * FROM documents ORDER BY uploaded_at DESC").fetchall()
+    return [_document_row(row) for row in rows]
+
+
+@app.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...)):
+    original_name = Path(file.filename or "").name
+    extension = Path(original_name).suffix.lower()
+    if extension not in DOCUMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX and TXT files are supported.")
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = DOCUMENTS_DIR / f".upload-{uuid.uuid4().hex}{extension}"
+    total = 0
+    try:
+        with temporary.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > DOCUMENT_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="Document exceeds the 50 MB upload limit.")
+                output.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="The selected file is empty.")
+        return _store_document(temporary, original_name, file.content_type)
+    finally:
+        temporary.unlink(missing_ok=True)
+        await file.close()
+
+
+@app.post("/documents/import-path")
+def import_document_path(data: DocumentImportPath):
+    source = Path(data.path).expanduser()
+    try:
+        source = source.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail="Dropped file could not be found.")
+    if source.suffix.lower() not in DOCUMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"{source.name}: only PDF, DOCX and TXT are supported.")
+    return _store_document(source, source.name)
+
+
+@app.get("/documents/{document_id}/file")
+def get_document_file(document_id: str):
+    """Serve the original uploaded document for in-app viewing/download."""
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT original_name, stored_name, mime_type FROM documents WHERE id=?",
+            (document_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    target = (DOCUMENTS_DIR / row["stored_name"]).resolve()
+    if target.parent != DOCUMENTS_DIR.resolve() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Stored document file is unavailable.")
+    media_type = row["mime_type"] or mimetypes.guess_type(row["original_name"])[0] or "application/octet-stream"
+    return FileResponse(
+        path=target,
+        media_type=media_type,
+        filename=row["original_name"],
+        content_disposition_type="inline" if media_type == "application/pdf" else "attachment"
+    )
+
+
+@app.get("/documents/{document_id}/text")
+def get_document_text(document_id: str):
+    with get_connection() as db:
+        row = db.execute("SELECT original_name, extracted_text, extraction_status, page_count, extraction_error FROM documents WHERE id=?", (document_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {
+        "filename": row["original_name"],
+        "text": "" if row["extraction_status"] == "needs_ocr" else (row["extracted_text"] or ""),
+        "status": row["extraction_status"], "page_count": row["page_count"],
+        "error": row["extraction_error"]
+    }
+
+
+@app.post("/documents/{document_id}/ocr")
+def run_document_ocr(document_id: str):
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT stored_name, file_type FROM documents WHERE id=?", (document_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if str(row["file_type"]).upper() != "PDF":
+        raise HTTPException(status_code=400, detail="OCR is currently available for PDF documents only.")
+    target = (DOCUMENTS_DIR / row["stored_name"]).resolve()
+    if target.parent != DOCUMENTS_DIR.resolve() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Stored PDF is unavailable.")
+    try:
+        extracted_text, page_count = _ocr_pdf(target)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {str(exc)[:500]}")
+    if not extracted_text:
+        raise HTTPException(status_code=422, detail="OCR completed but no readable text was recognized in this PDF.")
+    with get_connection() as db:
+        db.execute(
+            """UPDATE documents SET extracted_text=?, extraction_status='ocr_complete',
+               page_count=?, extracted_at=?, extraction_error=NULL WHERE id=?""",
+            (extracted_text, page_count, get_time(), document_id)
+        )
+    return {"status": "ocr_complete", "pages_processed": page_count, "extracted_chars": len(extracted_text)}
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    with get_connection() as db:
+        row = db.execute("SELECT stored_name FROM documents WHERE id=?", (document_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        stored_name = row["stored_name"]
+        db.execute("DELETE FROM documents WHERE id=?", (document_id,))
+    target = (DOCUMENTS_DIR / stored_name).resolve()
+    if target.parent == DOCUMENTS_DIR.resolve():
+        target.unlink(missing_ok=True)
+    return {"deleted": True, "id": document_id}
+
+
+# --------------------------------------------------
+# PHASE 7.3 — DOCUMENT STUDY, GROUNDED Q&A AND STUDY MATERIALS
+# --------------------------------------------------
+
+class DocumentAskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=4000)
+
+class DocumentSynopsisRequest(BaseModel):
+    style: str = Field(default="detailed", pattern="^(short|detailed|chapter|topic)$")
+
+class DocumentQuestionRequest(BaseModel):
+    count: int = Field(default=10, ge=1, le=30)
+    difficulty: str = Field(default="mixed", pattern="^(easy|medium|hard|mixed)$")
+    question_type: str = Field(default="mixed", pattern="^(mcq|short|long|mixed)$")
+
+class DocumentMaterialCreate(BaseModel):
+    material_type: str = Field(pattern="^(note|answer|synopsis|flashcards|glossary|questions|quiz|concept_map)$")
+    title: str = Field(default="", max_length=200)
+    content: str = Field(min_length=1, max_length=200000)
+
+
+def _get_study_document(document_id: str):
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT id, original_name, extracted_text, extraction_status, page_count FROM documents WHERE id=?",
+            (document_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    text = (row["extracted_text"] or "").strip()
+    if not text or row["extraction_status"] in ("needs_ocr", "failed", "pending"):
+        raise HTTPException(status_code=409, detail="This document has no usable extracted text yet. Run OCR or extraction first.")
+    return row, text
+
+
+def _document_passages(text: str, max_chars: int = 1400):
+    """Create bounded page-aware passages from the stored [Page N] text."""
+    pages = re.split(r"(?=\[Page\s+\d+\])", text)
+    passages = []
+    for index, raw in enumerate(pages, start=1):
+        if not raw.strip():
+            continue
+        match = re.match(r"\[Page\s+(\d+)\]\s*", raw)
+        page = int(match.group(1)) if match else index
+        body = raw[match.end():] if match else raw
+        body = body.strip()
+        if not body:
+            continue
+        # Split long pages at paragraph boundaries, then hard split only if needed.
+        chunks = []
+        current = ""
+        for paragraph in re.split(r"\n\s*\n", body):
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            if len(current) + len(paragraph) + 2 > max_chars and current:
+                chunks.append(current)
+                current = ""
+            while len(paragraph) > max_chars:
+                if current:
+                    chunks.append(current); current = ""
+                chunks.append(paragraph[:max_chars]); paragraph = paragraph[max_chars:]
+            current = (current + "\n\n" + paragraph).strip()
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            passages.append({"page": page, "text": chunk})
+    return passages
+
+
+def _retrieve_document_passages(text: str, query: str, limit: int = 7, document_id: str | None = None):
+    passages = _document_passages(text)
+    terms = {term.lower() for term in re.findall(r"[A-Za-z0-9]{3,}", query)}
+    if not terms:
+        return passages[:limit]
+    scored = []
+    for passage in passages:
+        words = re.findall(r"[A-Za-z0-9]{3,}", passage["text"].lower())
+        counts = {}
+        for word in words:
+            counts[word] = counts.get(word, 0) + 1
+        score = sum(min(counts.get(term, 0), 4) for term in terms)
+        if score:
+            scored.append((score, passage))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    lexical_ranked = [item[1] for item in scored]
+
+    # Rebuild the small per-document FTS index lazily, then combine BM25 and
+    # token-overlap rankings with reciprocal-rank fusion. This avoids a second
+    # embedding model competing for RAM on the user's 16 GB machine.
+    fts_ranked = []
+    if document_id:
+        try:
+            with get_connection() as db:
+                db.execute("DELETE FROM document_passages_fts WHERE document_id=?", (document_id,))
+                db.executemany(
+                    "INSERT INTO document_passages_fts(document_id, page, content) VALUES(?,?,?)",
+                    [(document_id, str(p["page"]), p["text"]) for p in passages]
+                )
+                match_query = " OR ".join('"' + term.replace('"', '') + '"' for term in sorted(terms))
+                if match_query:
+                    rows = db.execute(
+                        "SELECT page, content, bm25(document_passages_fts) AS score FROM document_passages_fts WHERE document_passages_fts MATCH ? AND document_id=? ORDER BY score LIMIT ?",
+                        (match_query, document_id, limit * 2)
+                    ).fetchall()
+                    fts_ranked = [{"page": int(r["page"]), "text": r["content"]} for r in rows]
+        except sqlite3.Error:
+            fts_ranked = []
+    if not fts_ranked:
+        return lexical_ranked[:limit]
+    fused = {}
+    for rank, passage in enumerate(fts_ranked, start=1):
+        key = (passage["page"], passage["text"])
+        fused[key] = fused.get(key, 0.0) + 1.0 / (60 + rank)
+    for rank, passage in enumerate(lexical_ranked, start=1):
+        key = (passage["page"], passage["text"])
+        fused[key] = fused.get(key, 0.0) + 1.0 / (60 + rank)
+    by_key = {(p["page"], p["text"]): p for p in passages}
+    return [by_key[key] for key, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+async def _document_model_completion(system_prompt: str, user_prompt: str, max_tokens: int = 900, temperature: float = 0.2):
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
+    try:
+        async with httpx.AsyncClient(timeout=240.0) as client:
+            response = await client.post(f"{LLAMA_CPP_URL}/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            result = response.json()
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content.strip():
+                raise RuntimeError("The local model returned an empty response.")
+            return content.strip()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"Local model is unavailable at {LLAMA_CPP_URL}. Start your configured llama.cpp model and retry. Details: {str(exc)[:300]}")
+    except (KeyError, IndexError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected response from the local model: {str(exc)[:200]}")
+
+
+def _extract_json_payload(raw: str):
+    """Parse JSON even when a local model adds fences or short preambles."""
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    # First try the entire response, then locate the first JSON object/array.
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    for index, char in enumerate(text):
+        if char in "[{":
+            try:
+                value, _ = decoder.raw_decode(text[index:])
+                return value
+            except Exception:
+                continue
+    raise ValueError("No valid JSON object or array was found in the model response")
+
+
+async def _document_json_completion(system_prompt: str, user_prompt: str, max_tokens: int = 1800):
+    """Request structured output, then make one local repair attempt if needed."""
+    raw = await _document_model_completion(system_prompt, user_prompt, max_tokens=max_tokens, temperature=0.1)
+    try:
+        return _extract_json_payload(raw)
+    except ValueError:
+        repaired = await _document_model_completion(
+            "Convert the supplied model output into valid JSON only. Preserve all factual content. "
+            "Do not add facts. Return a valid JSON array or object with no markdown fences.",
+            f"Required JSON schema/instructions:\n{system_prompt}\n\nOriginal output to repair:\n{raw}",
+            max_tokens=max_tokens, temperature=0.0
+        )
+        try:
+            return _extract_json_payload(repaired)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=(
+                "The local model completed but returned malformed structured data, even after one repair attempt. "
+                "Try fewer items or use a smaller document. " + str(exc)
+            ))
+
+
+@app.post("/documents/{document_id}/ask")
+async def ask_document(document_id: str, data: DocumentAskRequest):
+    row, text = _get_study_document(document_id)
+    passages = _retrieve_document_passages(text, data.question, limit=8, document_id=document_id)
+    if not passages:
+        return {"answer": "I could not find relevant information for this question in the extracted document. Try different wording or check the extracted text.", "sources": [], "grounded": False}
+    source_block = "\n\n".join(f"[Page {item['page']}]\n{item['text']}" for item in passages)
+    answer = await _document_model_completion(
+        "You are a document-grounded study assistant. Answer ONLY using the supplied excerpts. Cite every factual claim with [Page N]. If the excerpts do not contain the answer, say that the document does not provide enough information. Do not use outside knowledge. Be clear and concise.",
+        f"Document: {row['original_name']}\nQuestion: {data.question}\n\nRetrieved document excerpts:\n{source_block}\n\nAnswer with page citations.",
+        max_tokens=800
+    )
+    sources = sorted({item["page"] for item in passages})
+    return {"answer": answer, "sources": sources, "grounded": True}
+
+
+@app.post("/documents/{document_id}/synopsis")
+async def create_document_synopsis(document_id: str, data: DocumentSynopsisRequest):
+    row, text = _get_study_document(document_id)
+    # Keep the prompt within a conservative context budget on 16 GB machines.
+    passages = _document_passages(text, max_chars=1800)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in passages)
+    if len(content) > 24000:
+        content = content[:24000] + "\n[Document text truncated for this request]"
+    styles = {
+        "short": "Write a concise synopsis with the central topic, key points and conclusion.",
+        "detailed": "Write a detailed study synopsis with overview, main concepts, important details and conclusion.",
+        "chapter": "Organize the synopsis by chapter or section. If headings are absent, organize by the document's natural sections and say so.",
+        "topic": "Organize the synopsis topic-wise with clear headings and concise explanations."
+    }
+    result = await _document_model_completion(
+        "You summarize only the supplied document. Preserve its terminology and organization. Do not invent missing sections or facts. Include page references [Page N] for key points. If source text is incomplete, state that limitation.",
+        f"Create a synopsis for: {row['original_name']}\nInstruction: {styles[data.style]}\n\nDocument text:\n{content}",
+        max_tokens=1400
+    )
+    return {"synopsis": result, "style": data.style, "document_id": document_id}
+
+
+@app.post("/documents/{document_id}/questions")
+async def generate_document_questions(document_id: str, data: DocumentQuestionRequest):
+    row, text = _get_study_document(document_id)
+    passages = _document_passages(text, max_chars=1500)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in passages)
+    if len(content) > 22000:
+        content = content[:22000] + "\n[Document text truncated]"
+    questions = await _document_json_completion(
+        "You create study questions strictly from the supplied document. Return a JSON array of objects with keys: question, type, difficulty, answer, explanation, page, options. Every question MUST include a non-empty answer and explanation. For MCQ, options must be an array of four strings and answer must exactly match one option. For non-MCQ, options must be an empty array. Use page as an integer when identifiable, otherwise null. Do not invent facts. No markdown fences.",
+        f"Create exactly {data.count} questions from {row['original_name']}. Difficulty: {data.difficulty}. Type: {data.question_type}.\n\nDocument:\n{content}",
+        max_tokens=min(4200, 350 + data.count * 190)
+    )
+    if isinstance(questions, dict):
+        questions = questions.get("questions", [])
+    if not isinstance(questions, list):
+        raise HTTPException(status_code=502, detail="The local model returned JSON, but it was not a question array. Try again with fewer questions.")
+    normalized = []
+    for item in questions[:data.count]:
+        if not isinstance(item, dict) or not str(item.get("question", "")).strip():
+            continue
+        normalized.append({
+            "question": str(item.get("question", "")).strip(),
+            "type": str(item.get("type", data.question_type)),
+            "difficulty": str(item.get("difficulty", data.difficulty)),
+            "answer": str(item.get("answer", "Not specified in generated output")),
+            "explanation": str(item.get("explanation", "")),
+            "page": item.get("page") if isinstance(item.get("page"), int) else None,
+            "options": item.get("options", []) if isinstance(item.get("options", []), list) else []
+        })
+    if not normalized:
+        raise HTTPException(status_code=502, detail="No usable questions were returned by the local model.")
+    return {"document_id": document_id, "filename": row["original_name"], "questions": normalized}
+
+
+@app.post("/documents/{document_id}/flashcards")
+async def generate_document_flashcards(document_id: str, data: DocumentQuestionRequest):
+    row, text = _get_study_document(document_id)
+    passages = _document_passages(text, max_chars=1400)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in passages)[:18000]
+    cards = await _document_json_completion(
+        "Create flashcards only from the document. Return a JSON array with front, back, page. Every card must have a useful non-empty front and back. No markdown fences. Do not add outside facts.",
+        f"Create {data.count} concise study flashcards from {row['original_name']}.\n\n{content}",
+        max_tokens=min(2800, 250 + data.count * 120)
+    )
+    if isinstance(cards, dict): cards = cards.get("flashcards", [])
+    if not isinstance(cards, list):
+        raise HTTPException(status_code=502, detail="The local model returned JSON, but it was not a flashcard array.")
+    cards = [c for c in cards if isinstance(c, dict) and str(c.get("front", "")).strip() and str(c.get("back", "")).strip()]
+    if not cards:
+        raise HTTPException(status_code=502, detail="The model returned no usable flashcards. Try again with fewer cards.")
+    return {"document_id": document_id, "flashcards": cards[:data.count]}
+
+
+@app.post("/documents/{document_id}/concept-map")
+async def generate_document_concept_map(document_id: str):
+    row, text = _get_study_document(document_id)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in _document_passages(text, 1500))[:16000]
+    result = await _document_model_completion(
+        "Create a concept map strictly from the supplied document. Return Mermaid mindmap source only, beginning with 'mindmap'. Use short node labels. Do not add concepts absent from the source.",
+        f"Create a concept map for {row['original_name']}.\n\n{content}", max_tokens=1200
+    )
+    result = re.sub(r"^```(?:mermaid)?\s*|\s*```$", "", result.strip(), flags=re.I)
+    if not result.lstrip().startswith("mindmap"):
+        raise HTTPException(status_code=502, detail="The local model did not return a valid Mermaid mindmap. Try again.")
+    return {"document_id": document_id, "concept_map": result}
+
+
+@app.post("/documents/{document_id}/glossary")
+async def generate_document_glossary(document_id: str):
+    row, text = _get_study_document(document_id)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in _document_passages(text, 1600))[:18000]
+    terms = await _document_json_completion(
+        "Extract a glossary of important terms used in the document. Return a JSON array with term, definition, page. Definitions must reflect the document only. No markdown fences.",
+        f"Create a glossary for {row['original_name']}.\n\n{content}", max_tokens=1800
+    )
+    if isinstance(terms, dict): terms = terms.get("glossary", [])
+    if not isinstance(terms, list):
+        raise HTTPException(status_code=502, detail="The local model returned JSON, but it was not a glossary array.")
+    terms = [t for t in terms if isinstance(t, dict) and str(t.get("term", "")).strip() and str(t.get("definition", "")).strip()]
+    if not terms:
+        raise HTTPException(status_code=502, detail="The model returned no usable glossary terms. Try again.")
+    return {"document_id": document_id, "glossary": terms[:80]}
+
+
+@app.get("/documents/{document_id}/materials")
+def list_document_materials(document_id: str):
+    _get_study_document(document_id)
+    with get_connection() as db:
+        rows = db.execute("SELECT id, material_type, title, content, created_at FROM document_materials WHERE document_id=? ORDER BY created_at DESC", (document_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/documents/{document_id}/materials")
+def save_document_material(document_id: str, data: DocumentMaterialCreate):
+    _get_study_document(document_id)
+    material_id = str(uuid.uuid4())
+    with get_connection() as db:
+        db.execute("INSERT INTO document_materials(id, document_id, material_type, title, content, created_at) VALUES(?,?,?,?,?,?)", (material_id, document_id, data.material_type, data.title, data.content, get_time()))
+    return {"id": material_id, "document_id": document_id, "material_type": data.material_type, "title": data.title, "content": data.content}
+
+
+@app.delete("/documents/{document_id}/materials/{material_id}")
+def delete_document_material(document_id: str, material_id: str):
+    with get_connection() as db:
+        cursor = db.execute("DELETE FROM document_materials WHERE id=? AND document_id=?", (material_id, document_id))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Saved study material not found.")
+    return {"deleted": True}

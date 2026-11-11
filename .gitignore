@@ -1,0 +1,59 @@
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Node.js
+node_modules/
+dist/
+.vite/
+
+# Rust / Tauri
+**/target/
+**/gen/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# AI models
+models/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Local databases and application data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime binaries
+runtime/
+
+# Logs and backups
+logs/
+backups/
+generated/
+*.log
+*.backup
+*.bak
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Unused duplicate source files
+/app/src/
+/app/desktop/src-tauri/App.tsx
+
