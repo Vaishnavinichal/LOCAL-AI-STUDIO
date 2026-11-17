@@ -1,7 +1,7 @@
 import json
 import httpx
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 import os
 import sqlite3
 import uuid
@@ -10,17 +10,32 @@ import queue
 import threading
 import re
 import sys
-import time
-import asyncio
+import shutil
+import hashlib
+import mimetypes
 
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import pytesseract
+
+# Tesseract OCR configuration
+TESSERACT_EXE = os.environ.get(
+    "TESSERACT_CMD",
+    r"D:\Tesseract\tesseract.exe"
+)
+
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+
+os.environ["TESSDATA_PREFIX"] = os.environ.get(
+    "TESSDATA_PREFIX",
+    r"D:\Tesseract\tessdata"
+)
 
 # --------------------------------------------------
 # CONFIGURATION
@@ -47,7 +62,29 @@ LLAMA_CPP_URL = os.environ.get(
 # Set this to the friendly name of the model currently loaded in llama.cpp.
 # Example: $env:LOCAL_AI_MODEL_NAME = "Mistral 7B"
 MODEL_NAME = os.environ.get("LOCAL_AI_MODEL_NAME", "Mistral")
+# --------------------------------------------------
+# CODING MODEL CONFIGURATION
+# --------------------------------------------------
 
+CODING_MODEL_PATH = Path(os.environ.get(
+    "LOCAL_AI_CODING_MODEL",
+    r"D:\LOCAL-AI-STUDIO\models\coding\qwen2.5-coder-7b.gguf"
+))
+
+LLAMA_SERVER_EXE = Path(os.environ.get(
+    "LOCAL_AI_LLAMA_SERVER",
+    r"D:\LOCAL-AI-STUDIO\runtime\llama.cpp\llama-server.exe"
+))
+
+CODING_LLAMA_URL = os.environ.get(
+    "CODING_LLAMA_CPP_URL",
+    "http://127.0.0.1:8082"
+)
+
+CODING_MODEL_NAME = "Qwen2.5-Coder 7B"
+
+CODING_MODEL_PROCESS = None
+CODING_MODEL_LOCK = threading.Lock()
 # Active coding workspace is held in memory for this app session.
 # Phase 6.1 is intentionally read-only; no file-write or command execution routes exist.
 ACTIVE_CODING_WORKSPACE: Path | None = None
@@ -60,21 +97,6 @@ CODING_TERMINAL_TIMEOUT = 120
 CODING_TERMINAL_MAX_OUTPUT = 200_000
 CODING_DEBUG_SESSIONS = {}
 CODING_DEBUG_LOCK = threading.Lock()
-
-# Phase 6.10: separate local coding-model server. Chat and coding models are
-# intentionally kept mutually exclusive to protect 16 GB systems from RAM pressure.
-CODING_MODEL_PATH = Path(os.environ.get(
-    "LOCAL_AI_CODING_MODEL",
-    r"D:\LocalAIStudio\models\coding\qwen2.5-coder-3b-instruct-q4_k_m.gguf"
-))
-LLAMA_SERVER_EXE = Path(os.environ.get(
-    "LOCAL_AI_LLAMA_SERVER",
-    r"D:\LocalAIStudio\runtime\llama.cpp\llama-server.exe"
-))
-CODING_LLAMA_URL = os.environ.get("CODING_LLAMA_CPP_URL", "http://127.0.0.1:8082")
-CODING_MODEL_PROCESS = None
-CODING_MODEL_LOG_HANDLE = None
-CODING_MODEL_LOCK = threading.Lock()
 
 def get_time():
     return datetime.now(timezone.utc).isoformat()
@@ -182,6 +204,46 @@ def initialize_storage():
         """)
 
         db.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                original_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL UNIQUE,
+                file_type TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                uploaded_at TEXT NOT NULL
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_documents_uploaded ON documents(uploaded_at DESC)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS document_materials (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                material_type TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_document_materials_doc ON document_materials(document_id, created_at DESC)")
+        # SQLite FTS5 provides a persistent local lexical retrieval index for document RAG.
+        db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS document_passages_fts
+                      USING fts5(document_id UNINDEXED, page UNINDEXED, content, tokenize='unicode61')""")
+        document_columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)").fetchall()}
+        for column, definition in {
+            "extracted_text": "TEXT NOT NULL DEFAULT ''",
+            "extraction_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "page_count": "INTEGER",
+            "extracted_at": "TEXT",
+            "extraction_error": "TEXT"
+        }.items():
+            if column not in document_columns:
+                db.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+
+        db.execute("""
             CREATE TABLE IF NOT EXISTS coding_file_versions (
                 id TEXT PRIMARY KEY,
                 workspace_path TEXT NOT NULL,
@@ -239,6 +301,10 @@ class CodingWorkspaceSelect(BaseModel):
 # --------------------------------------------------
 # FASTAPI APPLICATION
 # --------------------------------------------------
+
+class DocumentImportPath(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -996,14 +1062,6 @@ class CodingDebugCommand(BaseModel):
     command: str = Field(min_length=1, max_length=500)
 
 
-class CodingAssistantRequest(BaseModel):
-    task: str = Field(pattern="^(ask|explain|debug|review|generate|fix|refactor)$")
-    prompt: str = Field(min_length=1, max_length=3000)
-    relative_path: str = Field(min_length=1, max_length=4096)
-    code: str = Field(default="", max_length=8000)
-    selection: str = Field(default="", max_length=4000)
-
-
 def _workspace_cwd(relative_path: str = "") -> Path:
     cwd = resolve_workspace_path(relative_path)
     if not cwd.exists() or not cwd.is_dir():
@@ -1112,7 +1170,231 @@ async def current_model():
         "available": model_id is not None
     }
 
+# --------------------------------------------------
+# CODING AI MODEL AND ASSISTANT
+# --------------------------------------------------
 
+class CodingAssistantRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=100)
+    prompt: str = Field(min_length=1, max_length=12000)
+    relative_path: str = Field(default="", max_length=4096)
+    code: str = Field(default="", max_length=50000)
+    selection: str | None = Field(default=None, max_length=20000)
+
+
+async def coding_model_health():
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{CODING_LLAMA_URL}/v1/models")
+            if response.status_code == 200:
+                payload = response.json()
+                models = payload.get("data", [])
+                model_id = models[0].get("id") if models else None
+                return True, model_id
+    except (httpx.RequestError, ValueError):
+        pass
+
+    return False, None
+
+
+@app.get("/coding/model/status")
+async def coding_model_status():
+    global CODING_MODEL_PROCESS
+
+    available, model_id = await coding_model_health()
+
+    process_running = (
+        CODING_MODEL_PROCESS is not None
+        and CODING_MODEL_PROCESS.poll() is None
+    )
+
+    return {
+        "available": available,
+        "process_running": available or process_running,
+        "model_id": model_id,
+        "model_path": str(CODING_MODEL_PATH),
+        "model_exists": CODING_MODEL_PATH.exists(),
+        "runtime_url": CODING_LLAMA_URL,
+        "message": (
+            "Coding model is ready."
+            if available
+            else "Coding model is not responding."
+        )
+    }
+
+
+@app.post("/coding/model/start")
+async def start_coding_model():
+    global CODING_MODEL_PROCESS
+
+    available, _ = await coding_model_health()
+
+    if available:
+        return {
+            "started": False,
+            "message": "Coding model is already running."
+        }
+
+    with CODING_MODEL_LOCK:
+        if CODING_MODEL_PROCESS is not None:
+            if CODING_MODEL_PROCESS.poll() is None:
+                return {
+                    "started": False,
+                    "message": "Coding model is already starting."
+                }
+            CODING_MODEL_PROCESS = None
+
+        if not LLAMA_SERVER_EXE.exists():
+            raise HTTPException(500, "llama-server.exe was not found.")
+
+        if not CODING_MODEL_PATH.exists():
+            raise HTTPException(404, "Coding GGUF model file was not found.")
+
+        try:
+            CODING_MODEL_PROCESS = subprocess.Popen(
+                [
+                    str(LLAMA_SERVER_EXE),
+                    "--model", str(CODING_MODEL_PATH),
+                    "--host", "127.0.0.1",
+                    "--port", "8082",
+                    "--ctx-size", "4096",
+                    "--threads", "4",
+                    "--n-gpu-layers", "0",
+                    "--parallel", "1"
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        except OSError as exc:
+            raise HTTPException(500, f"Unable to start coding model: {exc}")
+
+    return {
+        "started": True,
+        "message": "Coding model server is starting."
+    }
+
+
+@app.post("/coding/model/stop")
+async def stop_coding_model():
+    global CODING_MODEL_PROCESS
+
+    with CODING_MODEL_LOCK:
+        process = CODING_MODEL_PROCESS
+
+        if process is None:
+            available, _ = await coding_model_health()
+
+            if available:
+                return {
+                    "stopped": False,
+                    "message": "The model was started externally. Stop it using Ctrl+C in its PowerShell window."
+                }
+
+            return {
+                "stopped": False,
+                "message": "Coding model is not running."
+            }
+
+        if process.poll() is None:
+            process.terminate()
+
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+        CODING_MODEL_PROCESS = None
+
+    return {
+        "stopped": True,
+        "message": "Coding model stopped."
+    }
+
+
+@app.post("/coding/assistant")
+async def coding_assistant(data: CodingAssistantRequest):
+    available, model_id = await coding_model_health()
+
+    if not available:
+        raise HTTPException(
+            503,
+            "Coding model is not running. Start Qwen2.5-Coder first."
+        )
+
+    system_prompt = """
+You are the Coding AI assistant inside Local AI Studio.
+
+Help the user understand, debug, explain, refactor and improve code.
+Use the supplied source code and selection as context.
+Give practical, accurate answers.
+When suggesting code changes, provide complete replacement snippets
+for the relevant section and explain where they belong.
+Never claim that you modified files or executed commands.
+All changes must be reviewed and approved by the user.
+"""
+
+    user_prompt = f"""
+Task: {data.task}
+
+User request:
+{data.prompt}
+
+File path:
+{data.relative_path or "Not specified"}
+
+Current file code:
+{data.code or "No code supplied"}
+
+Selected code:
+{data.selection or "No selection"}
+"""
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                f"{CODING_LLAMA_URL}/v1/chat/completions",
+                json={
+                    "model": model_id or CODING_MODEL_NAME,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 1200,
+                    "stream": False
+                }
+            )
+
+            response.raise_for_status()
+            result = response.json()
+
+        content = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        if not content.strip():
+            raise HTTPException(502, "Coding model returned an empty response.")
+
+        return {
+            "content": content.strip(),
+            "task": data.task,
+            "proposal": True,
+            "model": CODING_MODEL_NAME
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Coding model response timed out.")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            502,
+            f"Coding model request failed: {exc.response.text[:500]}"
+        )
+    except httpx.RequestError:
+        raise HTTPException(503, "Unable to connect to the coding model.")
 # --------------------------------------------------
 # MESSAGE FEEDBACK
 # --------------------------------------------------
@@ -1399,176 +1681,6 @@ async def regenerate_assistant_response(
 
 
 # --------------------------------------------------
-# CODING MODEL + AI ASSISTANT - PHASE 6.10
-# --------------------------------------------------
-
-@app.get("/coding/model/status")
-async def coding_model_status():
-    process = CODING_MODEL_PROCESS
-    running_process = process is not None and process.poll() is None
-    available = False
-    model_id = None
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{CODING_LLAMA_URL}/health")
-            available = response.status_code == 200
-            if available:
-                models = await client.get(f"{CODING_LLAMA_URL}/v1/models")
-                if models.status_code == 200:
-                    items = models.json().get("data", [])
-                    model_id = items[0].get("id") if items else None
-    except (httpx.RequestError, ValueError):
-        pass
-    return {
-        "available": available,
-        "process_running": running_process,
-        "model_id": model_id,
-        "model_path": str(CODING_MODEL_PATH),
-        "model_exists": CODING_MODEL_PATH.is_file(),
-        "runtime_url": CODING_LLAMA_URL,
-        "message": "Coding model is ready" if available else "Coding model is unloaded"
-    }
-
-
-@app.post("/coding/model/start")
-async def start_coding_model():
-    global CODING_MODEL_PROCESS, CODING_MODEL_LOG_HANDLE
-    with CODING_MODEL_LOCK:
-        if CODING_MODEL_PROCESS is not None and CODING_MODEL_PROCESS.poll() is None:
-            return {"started": True, "message": "Coding model process is already running"}
-        if not CODING_MODEL_PATH.is_file():
-            raise HTTPException(404, f"Coding model file not found: {CODING_MODEL_PATH}")
-        if not LLAMA_SERVER_EXE.is_file():
-            raise HTTPException(404, f"llama-server.exe not found: {LLAMA_SERVER_EXE}")
-        # Do not silently run two large models on a 16 GB machine.
-        try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                chat_response = await client.get(f"{LLAMA_CPP_URL}/v1/models")
-                if chat_response.status_code == 200 and chat_response.json().get("data"):
-                    raise HTTPException(409, "Unload/stop the Chat model on port 8081 before starting the Coding model. This avoids loading both models into RAM.")
-        except httpx.RequestError:
-            pass
-        try:
-            async with httpx.AsyncClient(timeout=1.5) as client:
-                existing = await client.get(f"{CODING_LLAMA_URL}/health")
-                if existing.status_code == 200:
-                    return {"started": True, "message": "A coding model server is already available"}
-        except httpx.RequestError:
-            pass
-        log_dir = DATA_ROOT.parent / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "coding-model.log"
-        try:
-            CODING_MODEL_LOG_HANDLE = open(log_path, "a", encoding="utf-8", errors="replace")
-            CODING_MODEL_PROCESS = subprocess.Popen(
-                [str(LLAMA_SERVER_EXE), "--model", str(CODING_MODEL_PATH),
-                 "--host", "127.0.0.1", "--port", "8082", "--ctx-size", "4096",
-                 "--threads", "6", "--threads-batch", "6", "--n-gpu-layers", "0"],
-                stdin=subprocess.DEVNULL, stdout=CODING_MODEL_LOG_HANDLE,
-                stderr=subprocess.STDOUT, cwd=str(LLAMA_SERVER_EXE.parent),
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-        except OSError as exc:
-            raise HTTPException(500, f"Could not start coding model runtime: {exc}")
-    # Wait briefly for model load; keep this endpoint bounded and report log location.
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        if CODING_MODEL_PROCESS is None or CODING_MODEL_PROCESS.poll() is not None:
-            raise HTTPException(500, f"Coding model process exited. Check {log_path}")
-        try:
-            async with httpx.AsyncClient(timeout=1.5) as client:
-                response = await client.get(f"{CODING_LLAMA_URL}/health")
-                if response.status_code == 200:
-                    return {"started": True, "message": "Qwen2.5-Coder 3B is ready", "runtime_url": CODING_LLAMA_URL}
-        except httpx.RequestError:
-            pass
-        await asyncio.sleep(1)
-    raise HTTPException(504, f"Coding model is still loading. Check runtime log: {log_path}")
-
-
-@app.post("/coding/model/stop")
-def stop_coding_model():
-    global CODING_MODEL_PROCESS, CODING_MODEL_LOG_HANDLE
-    with CODING_MODEL_LOCK:
-        process = CODING_MODEL_PROCESS
-        if process is None or process.poll() is not None:
-            CODING_MODEL_PROCESS = None
-            return {"stopped": True, "message": "Coding model is already unloaded"}
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-        CODING_MODEL_PROCESS = None
-        if CODING_MODEL_LOG_HANDLE:
-            CODING_MODEL_LOG_HANDLE.close()
-            CODING_MODEL_LOG_HANDLE = None
-    return {"stopped": True, "message": "Coding model unloaded"}
-
-
-@app.post("/coding/assistant")
-async def coding_assistant(data: CodingAssistantRequest):
-    resolve_workspace_path(data.relative_path)
-    if not data.code.strip():
-        raise HTTPException(400, "Open a text file before asking the coding assistant")
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=3.0)) as client:
-            health = await client.get(f"{CODING_LLAMA_URL}/health")
-            if health.status_code != 200:
-                raise HTTPException(409, "Load the Qwen2.5-Coder model first using the Model button")
-            if data.task in {"generate", "fix", "refactor"}:
-                system = (
-                    "You are a careful local coding assistant. Return the COMPLETE updated file content only, "
-                    "without Markdown fences or explanations. Preserve unrelated behavior and imports. "
-                    "Do not claim to have executed or tested code. Never include secrets."
-                )
-            else:
-                system = (
-                    "You are a careful local coding assistant. Analyze only the supplied file and request. "
-                    "Explain uncertainty, identify likely issues, and provide practical suggestions. "
-                    "Do not claim code was executed or changed."
-                )
-            task_labels = {
-                "ask": "Answer the user's question about this code.",
-                "explain": "Explain this code clearly, including important functions and flow.",
-                "debug": "Find likely bugs and explain fixes; do not change the file.",
-                "review": "Review the code for correctness, security, performance and maintainability.",
-                "generate": "Modify or generate code according to the request and return the complete updated file.",
-                "fix": "Fix the requested bugs and return the complete updated file.",
-                "refactor": "Refactor the code as requested and return the complete updated file."
-            }
-            user_content = (
-                f"Task: {task_labels[data.task]}\nFile: {data.relative_path}\n"
-                f"User request: {data.prompt}\n"
-                + (f"Selected code:\n{data.selection}\n" if data.selection.strip() else "")
-                + f"Complete current file content:\n```\n{data.code}\n```"
-            )
-            response = await client.post(
-                f"{CODING_LLAMA_URL}/v1/chat/completions",
-                json={"messages": [{"role": "system", "content": system},
-                                   {"role": "user", "content": user_content}],
-                      "temperature": 0.2 if data.task in {"generate", "fix", "refactor"} else 0.4,
-                      "max_tokens": 2048, "stream": False}
-            )
-            response.raise_for_status()
-            payload = response.json()
-            content = payload["choices"][0]["message"]["content"]
-            return {"content": content, "task": data.task,
-                    "proposal": data.task in {"generate", "fix", "refactor"},
-                    "model": "Qwen2.5-Coder 3B Instruct"}
-    except HTTPException:
-        raise
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:1000] if exc.response is not None else str(exc)
-        raise HTTPException(502, f"Coding model request failed: {detail}")
-    except httpx.RequestError as exc:
-        raise HTTPException(502, f"Could not connect to coding model: {exc}")
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise HTTPException(502, f"Unexpected coding model response: {exc}")
-
-
-# --------------------------------------------------
 # CODING WORKSPACE - PHASES 6.7 / 6.8 / 6.9
 # --------------------------------------------------
 
@@ -1790,3 +1902,796 @@ def stop_coding_debug(session_id: str):
         except Exception:
             process.kill()
     return {"stopped": True}
+
+
+# --------------------------------------------------
+# PHASE 7.1 — DOCUMENT UPLOAD AND MANAGEMENT
+# --------------------------------------------------
+
+DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+DOCUMENT_ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+DOCUMENTS_DIR = DATA_ROOT / "documents"
+
+
+def _document_row(row):
+    keys = set(row.keys())
+    return {
+        "id": row["id"], "filename": row["original_name"],
+        "file_type": row["file_type"], "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"], "sha256": row["sha256"],
+        "status": row["extraction_status"] if "extraction_status" in keys else row["status"],
+        "uploaded_at": row["uploaded_at"],
+        "page_count": row["page_count"] if "page_count" in keys else None,
+        "extracted_chars": len(row["extracted_text"] or "") if "extracted_text" in keys else 0,
+    }
+
+
+def _extract_document(path: Path):
+    extension = path.suffix.lower()
+    if extension == ".txt":
+        raw = path.read_bytes()
+        try:
+            return raw.decode("utf-8-sig"), None
+        except UnicodeDecodeError:
+            return raw.decode("cp1252", errors="replace"), None
+    if extension == ".docx":
+        from docx import Document
+        doc = Document(str(path))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table_index, table in enumerate(doc.tables, start=1):
+            parts.append(f"[Table {table_index}]")
+            parts.extend(" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows)
+        return "\n".join(parts), None
+    if extension == ".pdf":
+        from pypdf import PdfReader
+        reader = PdfReader(str(path), strict=False)
+        pages = [f"[Page {number}]\n{(page.extract_text() or '').strip()}" for number, page in enumerate(reader.pages, start=1)]
+        return "\n\n".join(pages).strip(), len(reader.pages)
+    raise ValueError("Unsupported document type.")
+
+
+def _process_document(document_id: str, stored_name: str):
+    try:
+        extracted_text, page_count = _extract_document(DOCUMENTS_DIR / stored_name)
+        searchable_text = re.sub(r"\[Page \d+\]", "", extracted_text).strip()
+        status = "extracted" if searchable_text else "needs_ocr"
+        with get_connection() as db:
+            db.execute(
+                """UPDATE documents SET extracted_text=?, extraction_status=?,
+                   page_count=?, extracted_at=?, extraction_error=NULL WHERE id=?""",
+                (extracted_text, status, page_count, get_time(), document_id)
+            )
+    except Exception as exc:
+        with get_connection() as db:
+            db.execute(
+                """UPDATE documents SET extraction_status='failed',
+                   extraction_error=?, extracted_at=? WHERE id=?""",
+                (str(exc)[:1000], get_time(), document_id)
+            )
+
+
+def _resolve_tesseract():
+    """Find a local Tesseract executable; no network access is used."""
+    configured = os.environ.get("TESSERACT_CMD")
+    candidates = [configured] if configured else []
+    found = shutil.which("tesseract")
+    if found:
+        candidates.append(found)
+    candidates.extend([
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"D:\Tesseract-OCR\tesseract.exe",
+        r"D:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"D:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ])
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate))
+    return None
+
+
+def _ocr_pdf(path: Path):
+    """OCR each page separately to keep memory use bounded on 16 GB systems."""
+    executable = _resolve_tesseract()
+    if not executable:
+        raise RuntimeError(
+            "Tesseract OCR was not found. Install the Tesseract OCR Windows application, "
+            "or set the TESSERACT_CMD environment variable to the full path of tesseract.exe, "
+            "then restart LOCAL AI STUDIO."
+        )
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR Python dependencies are missing. Install pymupdf, pytesseract and Pillow "
+            "in the LOCAL AI STUDIO backend virtual environment."
+        ) from exc
+    pytesseract.pytesseract.tesseract_cmd = executable
+    parts = []
+    with fitz.open(str(path)) as pdf:
+        total_pages = len(pdf)
+        if total_pages > 300:
+            raise RuntimeError("OCR is limited to 300 pages per document in this prototype.")
+        for page_number, page in enumerate(pdf, start=1):
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            text = pytesseract.image_to_string(image, lang="eng", config="--oem 1 --psm 3")
+            parts.append(f"[Page {page_number}]\n{text.strip()}")
+            del image, pix
+    return "\n\n".join(parts).strip(), total_pages
+
+
+def _store_document(source_path: Path, original_name: str, mime_type: str | None = None):
+    original_name = Path(original_name).name
+    extension = Path(original_name).suffix.lower()
+    if not original_name or extension not in DOCUMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX and TXT files are supported.")
+    if not source_path.is_file() or source_path.is_symlink():
+        raise HTTPException(status_code=400, detail="The selected path is not a regular file.")
+    total = source_path.stat().st_size
+    if total <= 0:
+        raise HTTPException(status_code=400, detail="The selected file is empty.")
+    if total > DOCUMENT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Document exceeds the 50 MB limit.")
+    document_id = str(uuid.uuid4())
+    stored_name = f"{document_id}{extension}"
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = DOCUMENTS_DIR / stored_name
+    digest = hashlib.sha256()
+    try:
+        with source_path.open("rb") as src, destination.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                dst.write(chunk)
+        uploaded_at = get_time()
+        detected_mime = mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream"
+        with get_connection() as db:
+            db.execute(
+                """INSERT INTO documents
+                (id, original_name, stored_name, file_type, mime_type, size_bytes, sha256, status, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', ?)""",
+                (document_id, original_name, stored_name, extension.lstrip(".").upper(),
+                 detected_mime, total, digest.hexdigest(), uploaded_at)
+            )
+        _process_document(document_id, stored_name)
+        with get_connection() as db:
+            row = db.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+        return _document_row(row)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        with get_connection() as db:
+            db.execute("DELETE FROM documents WHERE id=?", (document_id,))
+        raise
+
+
+@app.get("/documents")
+def list_documents():
+    with get_connection() as db:
+        rows = db.execute("SELECT * FROM documents ORDER BY uploaded_at DESC").fetchall()
+    return [_document_row(row) for row in rows]
+
+
+@app.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...)):
+    original_name = Path(file.filename or "").name
+    extension = Path(original_name).suffix.lower()
+    if extension not in DOCUMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX and TXT files are supported.")
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = DOCUMENTS_DIR / f".upload-{uuid.uuid4().hex}{extension}"
+    total = 0
+    try:
+        with temporary.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > DOCUMENT_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="Document exceeds the 50 MB upload limit.")
+                output.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="The selected file is empty.")
+        return _store_document(temporary, original_name, file.content_type)
+    finally:
+        temporary.unlink(missing_ok=True)
+        await file.close()
+
+
+@app.post("/documents/import-path")
+def import_document_path(data: DocumentImportPath):
+    source = Path(data.path).expanduser()
+    try:
+        source = source.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail="Dropped file could not be found.")
+    if source.suffix.lower() not in DOCUMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"{source.name}: only PDF, DOCX and TXT are supported.")
+    return _store_document(source, source.name)
+
+
+@app.get("/documents/{document_id}/file")
+def get_document_file(document_id: str):
+    """Serve the original uploaded document for in-app viewing/download."""
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT original_name, stored_name, mime_type FROM documents WHERE id=?",
+            (document_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    target = (DOCUMENTS_DIR / row["stored_name"]).resolve()
+    if target.parent != DOCUMENTS_DIR.resolve() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Stored document file is unavailable.")
+    media_type = row["mime_type"] or mimetypes.guess_type(row["original_name"])[0] or "application/octet-stream"
+    return FileResponse(
+        path=target,
+        media_type=media_type,
+        filename=row["original_name"],
+        content_disposition_type="inline" if media_type == "application/pdf" else "attachment"
+    )
+
+
+@app.get("/documents/{document_id}/text")
+def get_document_text(document_id: str):
+    with get_connection() as db:
+        row = db.execute("SELECT original_name, extracted_text, extraction_status, page_count, extraction_error FROM documents WHERE id=?", (document_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {
+        "filename": row["original_name"],
+        "text": "" if row["extraction_status"] == "needs_ocr" else (row["extracted_text"] or ""),
+        "status": row["extraction_status"], "page_count": row["page_count"],
+        "error": row["extraction_error"]
+    }
+
+
+@app.post("/documents/{document_id}/ocr")
+def run_document_ocr(document_id: str):
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT stored_name, file_type FROM documents WHERE id=?", (document_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if str(row["file_type"]).upper() != "PDF":
+        raise HTTPException(status_code=400, detail="OCR is currently available for PDF documents only.")
+    target = (DOCUMENTS_DIR / row["stored_name"]).resolve()
+    if target.parent != DOCUMENTS_DIR.resolve() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Stored PDF is unavailable.")
+    try:
+        extracted_text, page_count = _ocr_pdf(target)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {str(exc)[:500]}")
+    if not extracted_text:
+        raise HTTPException(status_code=422, detail="OCR completed but no readable text was recognized in this PDF.")
+    with get_connection() as db:
+        db.execute(
+            """UPDATE documents SET extracted_text=?, extraction_status='ocr_complete',
+               page_count=?, extracted_at=?, extraction_error=NULL WHERE id=?""",
+            (extracted_text, page_count, get_time(), document_id)
+        )
+    return {"status": "ocr_complete", "pages_processed": page_count, "extracted_chars": len(extracted_text)}
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    with get_connection() as db:
+        row = db.execute("SELECT stored_name FROM documents WHERE id=?", (document_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        stored_name = row["stored_name"]
+        db.execute("DELETE FROM documents WHERE id=?", (document_id,))
+    target = (DOCUMENTS_DIR / stored_name).resolve()
+    if target.parent == DOCUMENTS_DIR.resolve():
+        target.unlink(missing_ok=True)
+    return {"deleted": True, "id": document_id}
+
+
+# --------------------------------------------------
+# PHASE 7.3 — DOCUMENT STUDY, GROUNDED Q&A AND STUDY MATERIALS
+# --------------------------------------------------
+
+class DocumentAskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=4000)
+
+class DocumentSynopsisRequest(BaseModel):
+    style: str = Field(default="detailed", pattern="^(short|detailed|chapter|topic)$")
+
+class DocumentQuestionRequest(BaseModel):
+    count: int = Field(default=10, ge=1, le=30)
+    difficulty: str = Field(default="mixed", pattern="^(easy|medium|hard|mixed)$")
+    question_type: str = Field(default="mixed", pattern="^(mcq|short|long|mixed)$")
+
+class DocumentMaterialCreate(BaseModel):
+    material_type: str = Field(pattern="^(note|answer|synopsis|flashcards|glossary|questions|quiz|concept_map)$")
+    title: str = Field(default="", max_length=200)
+    content: str = Field(min_length=1, max_length=200000)
+
+
+def _get_study_document(document_id: str):
+    with get_connection() as db:
+        row = db.execute(
+            "SELECT id, original_name, extracted_text, extraction_status, page_count FROM documents WHERE id=?",
+            (document_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    text = (row["extracted_text"] or "").strip()
+    if not text or row["extraction_status"] in ("needs_ocr", "failed", "pending"):
+        raise HTTPException(status_code=409, detail="This document has no usable extracted text yet. Run OCR or extraction first.")
+    return row, text
+
+
+def _document_passages(text: str, max_chars: int = 1400):
+    """Create bounded page-aware passages from the stored [Page N] text."""
+    pages = re.split(r"(?=\[Page\s+\d+\])", text)
+    passages = []
+    for index, raw in enumerate(pages, start=1):
+        if not raw.strip():
+            continue
+        match = re.match(r"\[Page\s+(\d+)\]\s*", raw)
+        page = int(match.group(1)) if match else index
+        body = raw[match.end():] if match else raw
+        body = body.strip()
+        if not body:
+            continue
+        # Split long pages at paragraph boundaries, then hard split only if needed.
+        chunks = []
+        current = ""
+        for paragraph in re.split(r"\n\s*\n", body):
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            if len(current) + len(paragraph) + 2 > max_chars and current:
+                chunks.append(current)
+                current = ""
+            while len(paragraph) > max_chars:
+                if current:
+                    chunks.append(current); current = ""
+                chunks.append(paragraph[:max_chars]); paragraph = paragraph[max_chars:]
+            current = (current + "\n\n" + paragraph).strip()
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            passages.append({"page": page, "text": chunk})
+    return passages
+
+
+def _retrieve_document_passages(text: str, query: str, limit: int = 7, document_id: str | None = None):
+    passages = _document_passages(text)
+    terms = {term.lower() for term in re.findall(r"[A-Za-z0-9]{3,}", query)}
+    if not terms:
+        return passages[:limit]
+    scored = []
+    for passage in passages:
+        words = re.findall(r"[A-Za-z0-9]{3,}", passage["text"].lower())
+        counts = {}
+        for word in words:
+            counts[word] = counts.get(word, 0) + 1
+        score = sum(min(counts.get(term, 0), 4) for term in terms)
+        if score:
+            scored.append((score, passage))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    lexical_ranked = [item[1] for item in scored]
+
+    # Rebuild the small per-document FTS index lazily, then combine BM25 and
+    # token-overlap rankings with reciprocal-rank fusion. This avoids a second
+    # embedding model competing for RAM on the user's 16 GB machine.
+    fts_ranked = []
+    if document_id:
+        try:
+            with get_connection() as db:
+                db.execute("DELETE FROM document_passages_fts WHERE document_id=?", (document_id,))
+                db.executemany(
+                    "INSERT INTO document_passages_fts(document_id, page, content) VALUES(?,?,?)",
+                    [(document_id, str(p["page"]), p["text"]) for p in passages]
+                )
+                match_query = " OR ".join('"' + term.replace('"', '') + '"' for term in sorted(terms))
+                if match_query:
+                    rows = db.execute(
+                        "SELECT page, content, bm25(document_passages_fts) AS score FROM document_passages_fts WHERE document_passages_fts MATCH ? AND document_id=? ORDER BY score LIMIT ?",
+                        (match_query, document_id, limit * 2)
+                    ).fetchall()
+                    fts_ranked = [{"page": int(r["page"]), "text": r["content"]} for r in rows]
+        except sqlite3.Error:
+            fts_ranked = []
+    if not fts_ranked:
+        return lexical_ranked[:limit]
+    fused = {}
+    for rank, passage in enumerate(fts_ranked, start=1):
+        key = (passage["page"], passage["text"])
+        fused[key] = fused.get(key, 0.0) + 1.0 / (60 + rank)
+    for rank, passage in enumerate(lexical_ranked, start=1):
+        key = (passage["page"], passage["text"])
+        fused[key] = fused.get(key, 0.0) + 1.0 / (60 + rank)
+    by_key = {(p["page"], p["text"]): p for p in passages}
+    return [by_key[key] for key, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+async def _document_model_completion(system_prompt: str, user_prompt: str, max_tokens: int = 900, temperature: float = 0.2):
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
+    try:
+        async with httpx.AsyncClient(timeout=240.0) as client:
+            response = await client.post(f"{LLAMA_CPP_URL}/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            result = response.json()
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content.strip():
+                raise RuntimeError("The local model returned an empty response.")
+            return content.strip()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"Local model is unavailable at {LLAMA_CPP_URL}. Start your configured llama.cpp model and retry. Details: {str(exc)[:300]}")
+    except (KeyError, IndexError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Unexpected response from the local model: {str(exc)[:200]}")
+
+
+def _extract_json_payload(raw: str):
+    """Parse JSON even when a local model adds fences or short preambles."""
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    # First try the entire response, then locate the first JSON object/array.
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    for index, char in enumerate(text):
+        if char in "[{":
+            try:
+                value, _ = decoder.raw_decode(text[index:])
+                return value
+            except Exception:
+                continue
+    raise ValueError("No valid JSON object or array was found in the model response")
+
+
+async def _document_json_completion(system_prompt: str, user_prompt: str, max_tokens: int = 1800):
+    """Request structured output, then make one local repair attempt if needed."""
+    raw = await _document_model_completion(system_prompt, user_prompt, max_tokens=max_tokens, temperature=0.1)
+    try:
+        return _extract_json_payload(raw)
+    except ValueError:
+        repaired = await _document_model_completion(
+            "Convert the supplied model output into valid JSON only. Preserve all factual content. "
+            "Do not add facts. Return a valid JSON array or object with no markdown fences.",
+            f"Required JSON schema/instructions:\n{system_prompt}\n\nOriginal output to repair:\n{raw}",
+            max_tokens=max_tokens, temperature=0.0
+        )
+        try:
+            return _extract_json_payload(repaired)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=(
+                "The local model completed but returned malformed structured data, even after one repair attempt. "
+                "Try fewer items or use a smaller document. " + str(exc)
+            ))
+
+
+@app.post("/documents/{document_id}/ask")
+async def ask_document(document_id: str, data: DocumentAskRequest):
+    row, text = _get_study_document(document_id)
+    passages = _retrieve_document_passages(text, data.question, limit=8, document_id=document_id)
+    if not passages:
+        return {"answer": "I could not find relevant information for this question in the extracted document. Try different wording or check the extracted text.", "sources": [], "grounded": False}
+    source_block = "\n\n".join(f"[Page {item['page']}]\n{item['text']}" for item in passages)
+    answer = await _document_model_completion(
+        "You are a document-grounded study assistant. Answer ONLY using the supplied excerpts. Cite every factual claim with [Page N]. If the excerpts do not contain the answer, say that the document does not provide enough information. Do not use outside knowledge. Be clear and concise.",
+        f"Document: {row['original_name']}\nQuestion: {data.question}\n\nRetrieved document excerpts:\n{source_block}\n\nAnswer with page citations.",
+        max_tokens=800
+    )
+    sources = sorted({item["page"] for item in passages})
+    return {"answer": answer, "sources": sources, "grounded": True}
+
+
+@app.post("/documents/{document_id}/synopsis")
+async def create_document_synopsis(document_id: str, data: DocumentSynopsisRequest):
+    row, text = _get_study_document(document_id)
+    # Keep the prompt within a conservative context budget on 16 GB machines.
+    passages = _document_passages(text, max_chars=1800)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in passages)
+    if len(content) > 24000:
+        content = content[:24000] + "\n[Document text truncated for this request]"
+    styles = {
+        "short": "Write a concise synopsis with the central topic, key points and conclusion.",
+        "detailed": "Write a detailed study synopsis with overview, main concepts, important details and conclusion.",
+        "chapter": "Organize the synopsis by chapter or section. If headings are absent, organize by the document's natural sections and say so.",
+        "topic": "Organize the synopsis topic-wise with clear headings and concise explanations."
+    }
+    result = await _document_model_completion(
+        "You summarize only the supplied document. Preserve its terminology and organization. Do not invent missing sections or facts. Include page references [Page N] for key points. If source text is incomplete, state that limitation.",
+        f"Create a synopsis for: {row['original_name']}\nInstruction: {styles[data.style]}\n\nDocument text:\n{content}",
+        max_tokens=1400
+    )
+    return {"synopsis": result, "style": data.style, "document_id": document_id}
+
+
+@app.post("/documents/{document_id}/questions")
+async def generate_document_questions(document_id: str, data: DocumentQuestionRequest):
+    row, text = _get_study_document(document_id)
+    passages = _document_passages(text, max_chars=1500)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in passages)
+    if len(content) > 22000:
+        content = content[:22000] + "\n[Document text truncated]"
+    questions = await _document_json_completion(
+        "You create study questions strictly from the supplied document. Return a JSON array of objects with keys: question, type, difficulty, answer, explanation, page, options. Every question MUST include a non-empty answer and explanation. For MCQ, options must be an array of four strings and answer must exactly match one option. For non-MCQ, options must be an empty array. Use page as an integer when identifiable, otherwise null. Do not invent facts. No markdown fences.",
+        f"Create exactly {data.count} questions from {row['original_name']}. Difficulty: {data.difficulty}. Type: {data.question_type}.\n\nDocument:\n{content}",
+        max_tokens=min(4200, 350 + data.count * 190)
+    )
+    if isinstance(questions, dict):
+        questions = questions.get("questions", [])
+    if not isinstance(questions, list):
+        raise HTTPException(status_code=502, detail="The local model returned JSON, but it was not a question array. Try again with fewer questions.")
+    normalized = []
+    for item in questions[:data.count]:
+        if not isinstance(item, dict) or not str(item.get("question", "")).strip():
+            continue
+        normalized.append({
+            "question": str(item.get("question", "")).strip(),
+            "type": str(item.get("type", data.question_type)),
+            "difficulty": str(item.get("difficulty", data.difficulty)),
+            "answer": str(item.get("answer", "Not specified in generated output")),
+            "explanation": str(item.get("explanation", "")),
+            "page": item.get("page") if isinstance(item.get("page"), int) else None,
+            "options": item.get("options", []) if isinstance(item.get("options", []), list) else []
+        })
+    if not normalized:
+        raise HTTPException(status_code=502, detail="No usable questions were returned by the local model.")
+    return {"document_id": document_id, "filename": row["original_name"], "questions": normalized}
+
+
+def _normalize_document_flashcards(raw_cards, requested_count: int):
+    """
+    Normalize common local-LLM flashcard response formats.
+    Accepts front/back and question/answer field names.
+    """
+    if isinstance(raw_cards, dict):
+        for key in ("flashcards", "cards", "items", "results"):
+            if isinstance(raw_cards.get(key), list):
+                raw_cards = raw_cards[key]
+                break
+
+    if not isinstance(raw_cards, list):
+        return []
+
+    normalized = []
+
+    for card in raw_cards:
+        if not isinstance(card, dict):
+            continue
+
+        front = (
+            card.get("front")
+            or card.get("question")
+            or card.get("term")
+            or card.get("prompt")
+        )
+
+        back = (
+            card.get("back")
+            or card.get("answer")
+            or card.get("definition")
+            or card.get("explanation")
+        )
+
+        front = str(front or "").strip()
+        back = str(back or "").strip()
+
+        if not front or not back:
+            continue
+
+        page = card.get("page")
+        if isinstance(page, str):
+            match = re.search(r"\d+", page)
+            page = int(match.group()) if match else None
+        elif not isinstance(page, int) or isinstance(page, bool):
+            page = None
+
+        normalized.append({
+            "front": front,
+            "back": back,
+            "page": page
+        })
+
+        if len(normalized) >= requested_count:
+            break
+
+    return normalized
+
+
+@app.post("/documents/{document_id}/flashcards")
+async def generate_document_flashcards(
+    document_id: str,
+    data: DocumentQuestionRequest
+):
+    row, text = _get_study_document(document_id)
+
+    passages = _document_passages(text, max_chars=1400)
+
+    content = "\n\n".join(
+        f"[Page {p['page']}]\n{p['text']}"
+        for p in passages
+    )[:18000]
+
+    system_prompt = """
+You are an expert study-material generator.
+
+Create flashcards using ONLY the supplied document.
+Do not use outside knowledge or invent facts.
+
+Return ONLY a valid JSON array.
+Every array item must have exactly these fields:
+{
+  "front": "A concise question or term",
+  "back": "A concise, accurate answer",
+  "page": 1
+}
+
+Rules:
+1. Every card must have a non-empty front and back.
+2. Ask one clear question per card.
+3. Cover important definitions, concepts, facts, processes and comparisons.
+4. Avoid duplicate or repetitive cards.
+5. Keep questions and answers concise but meaningful.
+6. Preserve technical terminology from the document.
+7. Use the correct source page number when identifiable.
+8. If the page is unknown, use null.
+9. Do not include explanations outside the JSON array.
+10. Do not use Markdown code fences.
+"""
+
+    user_prompt = f"""
+Create exactly {data.count} useful study flashcards.
+
+Document: {row['original_name']}
+Requested difficulty: {data.difficulty}
+
+Document content:
+{content}
+"""
+
+    max_tokens = min(2800, max(900, 400 + data.count * 180))
+
+    # First generation attempt
+    raw_cards = await _document_json_completion(
+        system_prompt,
+        user_prompt,
+        max_tokens=max_tokens
+    )
+    print("\n========== FLASHCARD DEBUG ==========")
+    print("MODEL RAW/PARSED RESPONSE:")
+    print(repr(cards))
+    print("RESPONSE TYPE:", type(cards))
+    print("=====================================\n")
+ 
+    cards = _normalize_document_flashcards(
+        raw_cards,
+        data.count
+    )
+
+    # Retry once if the first response contains no usable cards.
+    if not cards:
+        retry_prompt = f"""
+The previous response did not contain usable flashcards.
+
+Generate exactly {data.count} flashcards from the document below.
+
+Return ONLY a JSON array.
+Use precisely these keys for every card:
+front, back, page
+
+Example format:
+[
+  {{
+    "front": "What is the main concept?",
+    "back": "The explanation given in the document.",
+    "page": 1
+  }}
+]
+
+Do not use question/answer keys.
+Do not include Markdown or additional text.
+
+Document:
+{content}
+"""
+
+        raw_cards = await _document_json_completion(
+            system_prompt,
+            retry_prompt,
+            max_tokens=max_tokens
+        )
+
+        cards = _normalize_document_flashcards(
+            raw_cards,
+            data.count
+        )
+
+    if not cards:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The local model could not generate usable flashcards "
+                "after two attempts. Try a shorter document or fewer cards."
+            )
+        )
+
+    return {
+        "document_id": document_id,
+        "filename": row["original_name"],
+        "flashcards": cards,
+        "generated_count": len(cards),
+        "requested_count": data.count
+    }
+
+
+@app.post("/documents/{document_id}/concept-map")
+async def generate_document_concept_map(document_id: str):
+    row, text = _get_study_document(document_id)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in _document_passages(text, 1500))[:16000]
+    result = await _document_model_completion(
+        "Create a concept map strictly from the supplied document. Return Mermaid mindmap source only, beginning with 'mindmap'. Use short node labels. Do not add concepts absent from the source.",
+        f"Create a concept map for {row['original_name']}.\n\n{content}", max_tokens=1200
+    )
+    result = re.sub(r"^```(?:mermaid)?\s*|\s*```$", "", result.strip(), flags=re.I)
+    if not result.lstrip().startswith("mindmap"):
+        raise HTTPException(status_code=502, detail="The local model did not return a valid Mermaid mindmap. Try again.")
+    return {"document_id": document_id, "concept_map": result}
+
+
+@app.post("/documents/{document_id}/glossary")
+async def generate_document_glossary(document_id: str):
+    row, text = _get_study_document(document_id)
+    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in _document_passages(text, 1600))[:18000]
+    terms = await _document_json_completion(
+        "Extract a glossary of important terms used in the document. Return a JSON array with term, definition, page. Definitions must reflect the document only. No markdown fences.",
+        f"Create a glossary for {row['original_name']}.\n\n{content}", max_tokens=1800
+    )
+    if isinstance(terms, dict): terms = terms.get("glossary", [])
+    if not isinstance(terms, list):
+        raise HTTPException(status_code=502, detail="The local model returned JSON, but it was not a glossary array.")
+    terms = [t for t in terms if isinstance(t, dict) and str(t.get("term", "")).strip() and str(t.get("definition", "")).strip()]
+    if not terms:
+        raise HTTPException(status_code=502, detail="The model returned no usable glossary terms. Try again.")
+    return {"document_id": document_id, "glossary": terms[:80]}
+
+
+@app.get("/documents/{document_id}/materials")
+def list_document_materials(document_id: str):
+    _get_study_document(document_id)
+    with get_connection() as db:
+        rows = db.execute("SELECT id, material_type, title, content, created_at FROM document_materials WHERE document_id=? ORDER BY created_at DESC", (document_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/documents/{document_id}/materials")
+def save_document_material(document_id: str, data: DocumentMaterialCreate):
+    _get_study_document(document_id)
+    material_id = str(uuid.uuid4())
+    with get_connection() as db:
+        db.execute("INSERT INTO document_materials(id, document_id, material_type, title, content, created_at) VALUES(?,?,?,?,?,?)", (material_id, document_id, data.material_type, data.title, data.content, get_time()))
+    return {"id": material_id, "document_id": document_id, "material_type": data.material_type, "title": data.title, "content": data.content}
+
+
+@app.delete("/documents/{document_id}/materials/{material_id}")
+def delete_document_material(document_id: str, material_id: str):
+    with get_connection() as db:
+        cursor = db.execute("DELETE FROM document_materials WHERE id=? AND document_id=?", (material_id, document_id))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Saved study material not found.")
+    return {"deleted": True}

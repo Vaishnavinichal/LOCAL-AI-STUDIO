@@ -8,11 +8,14 @@ import uuid
 import subprocess
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import sys
 import shutil
 import hashlib
 import mimetypes
+import time
+from html.parser import HTMLParser
 
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -62,7 +65,29 @@ LLAMA_CPP_URL = os.environ.get(
 # Set this to the friendly name of the model currently loaded in llama.cpp.
 # Example: $env:LOCAL_AI_MODEL_NAME = "Mistral 7B"
 MODEL_NAME = os.environ.get("LOCAL_AI_MODEL_NAME", "Mistral")
+# --------------------------------------------------
+# CODING MODEL CONFIGURATION
+# --------------------------------------------------
 
+CODING_MODEL_PATH = Path(os.environ.get(
+    "LOCAL_AI_CODING_MODEL",
+    r"D:\LOCAL-AI-STUDIO\models\coding\qwen2.5-coder-7b.gguf"
+))
+
+LLAMA_SERVER_EXE = Path(os.environ.get(
+    "LOCAL_AI_LLAMA_SERVER",
+    r"D:\LOCAL-AI-STUDIO\runtime\llama.cpp\llama-server.exe"
+))
+
+CODING_LLAMA_URL = os.environ.get(
+    "CODING_LLAMA_CPP_URL",
+    "http://127.0.0.1:8082"
+)
+
+CODING_MODEL_NAME = "Qwen2.5-Coder 7B"
+
+CODING_MODEL_PROCESS = None
+CODING_MODEL_LOCK = threading.Lock()
 # Active coding workspace is held in memory for this app session.
 # Phase 6.1 is intentionally read-only; no file-write or command execution routes exist.
 ACTIVE_CODING_WORKSPACE: Path | None = None
@@ -239,6 +264,316 @@ def initialize_storage():
 
 
 # --------------------------------------------------
+        # PHASE 9: LOCAL MODEL MANAGER
+        # --------------------------------------------------
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS model_registry (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                family TEXT NOT NULL DEFAULT 'Unknown',
+                version TEXT NOT NULL DEFAULT '',
+                format TEXT NOT NULL DEFAULT 'unknown',
+                runtime TEXT NOT NULL DEFAULT 'unknown',
+                source_type TEXT NOT NULL DEFAULT 'local_file',
+                file_path TEXT,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT,
+                status TEXT NOT NULL DEFAULT 'discovered',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_model_registry_path
+            ON model_registry(file_path)
+            WHERE file_path IS NOT NULL
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_model_registry_status
+            ON model_registry(status, name)
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS model_endpoints (
+                id TEXT PRIMARY KEY,
+                model_id TEXT,
+                name TEXT NOT NULL,
+                runtime TEXT NOT NULL,
+                endpoint_url TEXT NOT NULL,
+                external_model_id TEXT NOT NULL DEFAULT '',
+                ownership TEXT NOT NULL DEFAULT 'external',
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                last_status TEXT NOT NULL DEFAULT 'unknown',
+                last_checked TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(model_id)
+                    REFERENCES model_registry(id)
+                    ON DELETE SET NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_model_endpoint_url
+            ON model_endpoints(endpoint_url, external_model_id)
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS model_capability_assignments (
+                capability TEXT PRIMARY KEY,
+                model_id TEXT,
+                endpoint_id TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(model_id)
+                    REFERENCES model_registry(id)
+                    ON DELETE SET NULL,
+                FOREIGN KEY(endpoint_id)
+                    REFERENCES model_endpoints(id)
+                    ON DELETE SET NULL
+            )
+        """)
+
+        db.execute("""CREATE TABLE IF NOT EXISTS model_download_jobs (
+            id TEXT PRIMARY KEY, provider TEXT NOT NULL, model_name TEXT NOT NULL,
+            version TEXT NOT NULL, status TEXT NOT NULL, downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+            total_bytes INTEGER, destination TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+
+        # Preserve installation time independently from discovery/last_seen.
+        model_columns = {row["name"] for row in db.execute("PRAGMA table_info(model_registry)").fetchall()}
+        if "installed_at" not in model_columns:
+            db.execute("ALTER TABLE model_registry ADD COLUMN installed_at TEXT")
+        if "installed_at_source" not in model_columns:
+            db.execute("ALTER TABLE model_registry ADD COLUMN installed_at_source TEXT")
+        job_columns = {row["name"] for row in db.execute("PRAGMA table_info(model_download_jobs)").fetchall()}
+        if "message" not in job_columns:
+            db.execute("ALTER TABLE model_download_jobs ADD COLUMN message TEXT NOT NULL DEFAULT ''")
+        if "speed_bytes_per_second" not in job_columns:
+            db.execute("ALTER TABLE model_download_jobs ADD COLUMN speed_bytes_per_second INTEGER NOT NULL DEFAULT 0")
+
+# ============================================================
+# PHASE 9: LOCAL MODEL MANAGER - MODEL DISCOVERY
+# ============================================================
+
+MODEL_DISCOVERY_ENDPOINTS = [
+    {
+        "name": "Ollama",
+        "runtime": "ollama",
+        "url": os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
+    },
+    {
+        "name": "llama.cpp Chat",
+        "runtime": "llama.cpp",
+        "url": os.environ.get("LLAMA_CPP_URL", "http://127.0.0.1:8081").rstrip("/"),
+    },
+    {
+        "name": "llama.cpp Coding",
+        "runtime": "llama.cpp",
+        "url": os.environ.get("CODING_LLAMA_CPP_URL", "http://127.0.0.1:8082").rstrip("/"),
+    },
+]
+
+
+def infer_model_capabilities(name, details):
+    """Suggest capabilities only when model naming/metadata provides a clue."""
+    lowered = name.lower()
+    capabilities = []
+    if "embed" in lowered or details.get("embedding_length"):
+        capabilities.append("embedding")
+    if any(term in lowered for term in ("vl", "vision", "llava", "gemma3")):
+        capabilities.append("vision")
+    if "coder" in lowered or "code" in lowered:
+        capabilities.append("coding")
+    if not capabilities and details.get("family"):
+        capabilities.append("completion")
+    return capabilities
+
+
+def discover_local_models():
+    """Discover models exposed by local Ollama and llama.cpp servers."""
+
+    now = get_time()
+    discovered = []
+    connections = []
+
+    with get_connection() as db:
+
+        for server in MODEL_DISCOVERY_ENDPOINTS:
+            base_url = server["url"]
+            runtime = server["runtime"]
+
+            try:
+                if runtime == "ollama":
+                    response = httpx.get(
+                        f"{base_url}/api/tags",
+                        timeout=5.0,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    # Ollama's tags endpoint is normally {models: [...]}; accept
+                    # the wrapped data/value forms returned by compatible servers too.
+                    models = payload.get("models", payload.get("data", payload.get("value", []))) if isinstance(payload, dict) else payload
+                    if not isinstance(models, list): models = []
+                    seen_ollama_names = set()
+
+                    for model in models:
+                        name = model.get("name", "Unknown")
+                        details = model.get("details") or {}
+                        digest = model.get("digest", "")
+                        size = int(model.get("size") or 0)
+
+                        # The full Ollama name includes the exact tag/variant. A
+                        # digest is content identity and can change on replacement.
+                        canonical_name = name.strip()
+                        seen_ollama_names.add(canonical_name.casefold())
+                        identity = "ollama:" + canonical_name.casefold()
+                        model_id = "ollama-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+                        existing = db.execute("SELECT id,installed_at,installed_at_source FROM model_registry WHERE source_type='ollama' AND lower(name)=lower(?) LIMIT 1", (canonical_name,)).fetchone()
+                        if existing:
+                            model_id = existing["id"]
+                        modified_at = model.get("modified_at")
+                        installed_at = existing["installed_at"] if existing else modified_at
+                        installed_at_source = existing["installed_at_source"] if existing and existing["installed_at"] else ("provider_estimate" if modified_at else None)
+
+                        metadata = {
+                            "ollama_name": name,
+                            "is_cloud": bool(model.get("remote") or model.get("cloud") or name.casefold().endswith(":cloud")),
+                            "digest": digest,
+                            "capabilities": model.get("capabilities") or infer_model_capabilities(name, details),
+                            "capabilities_inferred": not bool(model.get("capabilities")),
+                            "parameter_size": details.get("parameter_size", ""),
+                            "quantization": details.get("quantization_level", ""),
+                            "context_length": details.get("context_length"),
+                            "embedding_length": details.get("embedding_length"),
+                        }
+
+                        db.execute("""
+                            INSERT INTO model_registry (
+                                id, name, family, version, format,
+                                runtime, source_type, file_path,
+                                file_size_bytes, sha256, status,
+                                metadata_json, first_seen, last_seen,
+                                created_at, updated_at, installed_at, installed_at_source
+                            )
+                            VALUES (?, ?, ?, '', ?, ?, 'ollama',
+                                    NULL, ?, ?, 'installed', ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                name=excluded.name,
+                                family=excluded.family,
+                                file_size_bytes=excluded.file_size_bytes,
+                                metadata_json=excluded.metadata_json,
+                                last_seen=excluded.last_seen,
+                                updated_at=excluded.updated_at,
+                                status='installed',
+                                installed_at=COALESCE(model_registry.installed_at, excluded.installed_at),
+                                installed_at_source=COALESCE(model_registry.installed_at_source, excluded.installed_at_source)
+                        """, (
+                            model_id, name,
+                            details.get("family", "Unknown"),
+                            details.get("format", "ollama"),
+                            runtime, size, digest,
+                            json.dumps(metadata),
+                            now, now, now, now, installed_at, installed_at_source
+                        ))
+                        # Coalesce legacy digest-keyed rows for this exact tag.
+                        db.execute("DELETE FROM model_registry WHERE source_type='ollama' AND lower(name)=lower(?) AND id<>?", (canonical_name, model_id))
+
+                        discovered.append({
+                            "id": model_id,
+                            "name": name,
+                            "runtime": runtime,
+                        })
+
+                    # This provider response is authoritative for Ollama. Remove
+                    # stale local registrations; never touch Hugging Face records.
+                    registered = db.execute("SELECT id,name,metadata_json FROM model_registry WHERE source_type='ollama' AND status='installed'").fetchall()
+                    for stale in registered:
+                        if stale["name"].casefold() not in seen_ollama_names:
+                            try: registered_meta = json.loads(stale["metadata_json"] or "{}")
+                            except (TypeError, json.JSONDecodeError): registered_meta = {}
+                            if stale["name"].casefold().endswith(":cloud") or registered_meta.get("is_cloud"):
+                                continue
+                            db.execute("DELETE FROM model_registry WHERE id=?", (stale["id"],))
+
+                else:
+                    response = httpx.get(
+                        f"{base_url}/v1/models",
+                        timeout=5.0,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+
+                    # llama.cpp exposes model metadata in data.
+                    models = payload.get("data", payload.get("models", payload.get("value", []))) if isinstance(payload, dict) else payload
+                    if not isinstance(models, list): models = []
+
+                    for model in models:
+                        external_id = model.get("id", "")
+                        meta = model.get("meta") or {}
+                        model_name = Path(external_id).name or external_id
+
+                        # Exact identity only; never infer associations from file size.
+                        match = db.execute("SELECT id FROM model_registry WHERE lower(name)=?", (external_id.strip().lower(),)).fetchone()
+                        linked_model_id = match["id"] if match else None
+
+                        endpoint_id = (
+                            "endpoint-" + hashlib.sha256(
+                                (base_url + "|" + external_id).encode()
+                            ).hexdigest()[:24]
+                        )
+
+                        db.execute("""
+                            INSERT INTO model_endpoints (
+                                id, model_id, name, runtime,
+                                endpoint_url, external_model_id,
+                                ownership, is_enabled, last_status,
+                                last_checked, created_at, updated_at
+                            )
+                            VALUES (?, ?, ?, 'llama.cpp', ?, ?,
+                                    'external', 1, 'online', ?, ?, ?)
+                            ON CONFLICT(endpoint_url, external_model_id)
+                            DO UPDATE SET
+                                last_status='online',
+                                last_checked=excluded.last_checked,
+                                updated_at=excluded.updated_at
+                        """, (
+                            endpoint_id, linked_model_id,
+                            server["name"], base_url,
+                            external_id, now, now, now
+                        ))
+
+                        connections.append({
+                            "name": server["name"],
+                            "url": base_url,
+                            "model": model_name,
+                            "linked": bool(linked_model_id),
+                        })
+
+            except Exception as exc:
+                connections.append({
+                    "name": server["name"],
+                    "url": base_url,
+                    "status": "offline",
+                    "error": str(exc),
+                })
+
+        db.commit()
+
+    unique = {item["id"]: item for item in discovered}
+    return {
+        "discovered_count": len(unique),
+        "models": list(unique.values()),
+        "connections": connections,
+    }
+
+# --------------------------------------------------
 # REQUEST SCHEMAS
 # --------------------------------------------------
 
@@ -341,6 +676,645 @@ def storage_status():
         "database_exists": DB_PATH.exists()
     }
 
+
+@app.post("/models/discover")
+def models_discover():
+    return discover_local_models()
+
+
+@app.get("/models")
+def models_list():
+    with get_connection() as db:
+        rows = db.execute("""
+            SELECT * FROM model_registry
+            ORDER BY name COLLATE NOCASE
+        """).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+@app.delete("/models/{model_id}")
+def uninstall_model(model_id: str):
+    with get_connection() as db:
+        row = db.execute("SELECT * FROM model_registry WHERE id=?", (model_id,)).fetchone()
+        if not row: raise HTTPException(status_code=404, detail="Model registration not found.")
+        model = dict(row)
+        try: model_metadata = json.loads(model.get("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError): model_metadata = {}
+        is_cloud = model["source_type"] == "ollama" and (model["name"].casefold().endswith(":cloud") or bool(model_metadata.get("is_cloud")))
+        if model["status"] not in {"installed", "downloaded"}:
+            raise HTTPException(status_code=409, detail="This model is not removable through its provider.")
+        if model["source_type"] == "ollama":
+            name = model["name"]
+            try:
+                base = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+                with httpx.Client(timeout=10) as client:
+                    running = client.get(f"{base}/api/ps")
+                    running.raise_for_status()
+                    running_payload = running.json()
+                    running_models = running_payload.get("models", []) if isinstance(running_payload, dict) else []
+                    if any(m.get("name") == name for m in running_models):
+                        raise HTTPException(status_code=409, detail="This Ollama model is currently loaded. Unload it in Ollama, then retry removal.")
+                    deleted = client.request("DELETE", f"{base}/api/delete", json={"name": name})
+                    deleted.raise_for_status()
+            except HTTPException: raise
+            except Exception as exc: raise HTTPException(status_code=502, detail=f"Ollama could not remove {name}: {exc}")
+        elif model["source_type"] == "huggingface":
+            path_text = model.get("file_path")
+            if not path_text: raise HTTPException(status_code=409, detail="No app-managed model file is registered.")
+            path = Path(path_text).resolve()
+            root = (MODEL_STORAGE_DIR / "huggingface").resolve()
+            if root not in path.parents or not path.is_file():
+                raise HTTPException(status_code=409, detail="The registered file is outside app-managed Hugging Face storage; it was left untouched.")
+            with get_connection() as db:
+                active = db.execute("SELECT id FROM model_endpoints WHERE (model_id=? OR lower(external_model_id)=lower(?)) AND last_status='online'", (model_id, str(path))).fetchone()
+                if active: raise HTTPException(status_code=409, detail="A runtime endpoint is using this model. Stop using it before removal.")
+            for server in MODEL_DISCOVERY_ENDPOINTS:
+                if server["runtime"] != "llama.cpp": continue
+                try:
+                    response = httpx.get(f"{server['url']}/v1/models", timeout=3.0)
+                    response.raise_for_status()
+                    payload = response.json()
+                    for loaded in (payload.get("data", []) if isinstance(payload, dict) else []):
+                        external = str(loaded.get("id", ""))
+                        try: loaded_path = Path(external).resolve()
+                        except OSError: continue
+                        if loaded_path == path:
+                            raise HTTPException(status_code=409, detail="A llama.cpp runtime is currently using this model. Stop using it before removal.")
+                except HTTPException: raise
+                except Exception: continue
+            try: path.unlink()
+            except OSError as exc: raise HTTPException(status_code=500, detail=f"Could not remove the model file: {exc}")
+        else:
+            raise HTTPException(status_code=409, detail="This provider does not support safe removal.")
+        db.execute("DELETE FROM model_registry WHERE id=?", (model_id,))
+        return {"deleted": True, "id": model_id, "storage_impact": "Ollama cloud registration removed; cloud model weights were not deleted" if is_cloud else "Ollama removed the local model and managed data" if model["source_type"] == "ollama" else "App-managed GGUF file removed"}
+
+
+@app.get("/models/endpoints")
+def models_endpoints():
+    with get_connection() as db:
+        rows = db.execute("""
+            SELECT * FROM model_endpoints
+            ORDER BY name
+        """).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+# Phase 9.5 provider adapters: public catalogs only; installation remains local.
+class MarketplaceLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.text = []
+        self._href = None
+        self._text = []
+        self._h2 = False
+        self.headings = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "h2": self._h2 = True
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if data.strip(): self.text.append(data.strip())
+        if self._h2 and data.strip(): self.headings.append(data.strip())
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "h2": self._h2 = False
+        if tag == "a" and self._href:
+            self.links.append((self._href, " ".join(" ".join(self._text).split())))
+            self._href, self._text = None, []
+
+
+class OllamaTagPageParser(HTMLParser):
+    """Capture a complete tag row; Ollama renders size beside, not inside, its link."""
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.depth = 0
+        self.current_hrefs = []
+        self.current_text = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "div":
+            if self.depth == 0 and "group" in (attributes.get("class") or "").split():
+                self.depth = 1
+                self.current_hrefs, self.current_text = [], []
+            elif self.depth:
+                self.depth += 1
+        elif tag == "a" and self.depth and attributes.get("href"):
+            self.current_hrefs.append(attributes["href"])
+
+    def handle_data(self, data):
+        if self.depth and data.strip(): self.current_text.append(data.strip())
+
+    def handle_endtag(self, tag):
+        if tag != "div" or not self.depth: return
+        self.depth -= 1
+        if self.depth == 0:
+            row_text = " ".join(self.current_text)
+            self.rows.extend((href, row_text) for href in self.current_hrefs)
+            self.current_hrefs, self.current_text = [], []
+
+
+OLLAMA_LIBRARY_CACHE = {}
+OLLAMA_LIBRARY_CACHE_LOCK = threading.Lock()
+OLLAMA_LIBRARY_CACHE_SECONDS = 600
+_OLLAMA_SIZE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?\s*(?:KB|MB|GB|TB))(?:\s*[-–]\s*(?P<high>\d+(?:\.\d+)?\s*(?:KB|MB|GB|TB)))?", re.I)
+
+
+def _ollama_size_bytes(value):
+    if not value: return None
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(KB|MB|GB|TB)\s*", value, re.I)
+    if not match: return None
+    return int(float(match.group(1)) * (1024 ** {"KB": 1, "MB": 2, "GB": 3, "TB": 4}[match.group(2).upper()]))
+
+
+def _ollama_library_metadata(model_id, refresh=False):
+    """Read sizes, tags and descriptive metadata from Ollama's public model pages."""
+    now = time.monotonic()
+    with OLLAMA_LIBRARY_CACHE_LOCK:
+        cached = OLLAMA_LIBRARY_CACHE.get(model_id)
+        if not refresh and cached and cached[0] > now: return cached[1]
+    tags_url = f"https://ollama.com/library/{model_id}/tags"
+    page_url = f"https://ollama.com/library/{model_id}"
+    with _marketplace_http() as client:
+        tags_response = client.get(tags_url); tags_response.raise_for_status()
+        page_response = client.get(page_url); page_response.raise_for_status()
+    tags_page = MarketplaceLinkParser(); tags_page.feed(tags_response.text)
+    tag_rows = OllamaTagPageParser(); tag_rows.feed(tags_response.text)
+    model_page = MarketplaceLinkParser(); model_page.feed(page_response.text)
+    variants = []
+    for href, label in (tag_rows.rows or tags_page.links):
+        match = re.fullmatch(rf"/library/{re.escape(model_id)}:([A-Za-z0-9_.-]+)", href or "")
+        if not match: continue
+        tag = f"{model_id}:{match.group(1)}"
+        size_match = _OLLAMA_SIZE_RE.search(label)
+        display = None
+        low_bytes = high_bytes = None
+        if size_match:
+            low, high = size_match.group("value"), size_match.group("high")
+            low_bytes, high_bytes = _ollama_size_bytes(low), _ollama_size_bytes(high) if high else None
+            display = low if not high else f"{low}–{high}"
+        variants.append({"name": tag, "size": display, "size_bytes": low_bytes if not high_bytes else None,
+                         "size_min_bytes": low_bytes, "size_max_bytes": high_bytes or low_bytes,
+                         "cloud": match.group(1).casefold().endswith("cloud"), "provider_label": label})
+    variants = list({variant["name"]: variant for variant in variants}.values())
+    full_text = " ".join(model_page.text + tags_page.text + model_page.headings).strip()
+    tags_match = re.search(r"(?<![\w])(?:vision|tools|thinking|cloud|embedding|audio|video|completion|coding)(?:\s+(?:vision|tools|thinking|cloud|embedding|audio|video|completion|coding))*", full_text, re.I)
+    capabilities = list(dict.fromkeys(re.findall(r"(?<![\w])(vision|tools|thinking|embedding|audio|video|completion|coding)(?![\w])", tags_match.group(0), re.I))) if tags_match else []
+    parameters = None
+    param_match = re.search(r"\b(\d+(?:\.\d+)?\s*[BM])\s*(?:total\s*)?(?:parameters?|params)\b", full_text, re.I)
+    if not param_match:
+        param_match = re.search(r"\b(\d+(?:\.\d+)?\s*[BM])\s+(?:(?:dense|mixture-of-experts|local|language|vision)\s+){0,2}model\b", " ".join(model_page.headings + model_page.text), re.I)
+    if param_match:
+        parameters = re.sub(r"\s+", "", param_match.group(1)).upper()
+    else:
+        variant_params = list(dict.fromkeys(re.sub(r"\s+", "", value).upper() for variant in variants
+                                             for value in re.findall(r":(\d+(?:\.\d+)?\s*[BM])(?:[-_.]|$)", variant["name"], re.I)))
+        if variant_params: parameters = " / ".join(variant_params)
+    contexts = re.findall(r"\b([\d,.]+\s*[KMB])\s+(?:token\s+)?context(?:\s+window)?\b", full_text, re.I)
+    context_length = contexts[0].replace(" ", "") if contexts else None
+    architecture_match = re.search(r"\barchitecture\s*:?\s*([A-Za-z][A-Za-z0-9_.+-]*)", full_text, re.I)
+    license_match = re.search(r"\b(?:license|licence)\s*:?\s*([A-Za-z0-9.+-]+)", full_text, re.I)
+    cloud = bool(variants) and all(v["cloud"] for v in variants)
+    if not variants and re.search(r"\bcloud\b", full_text, re.I): cloud = True
+    descriptions = [x for x in model_page.headings if x.strip()]
+    result = {"description": descriptions[0] if descriptions else "", "architecture": architecture_match.group(1) if architecture_match else None,
+              "license": license_match.group(1) if license_match else None, "variants": variants,
+              "versions": [v["name"] for v in variants], "is_cloud": cloud,
+              "parameter_count": parameters, "context_length": context_length,
+              "capabilities": capabilities, "size_range": None, "refreshed_at": get_time()}
+    sizes = [v for v in variants if v["size_min_bytes"] is not None]
+    if cloud:
+        result["download_size"] = None
+    elif sizes:
+        mins = [v["size_min_bytes"] for v in sizes]; maxs = [v["size_max_bytes"] for v in sizes]
+        result["size_min_bytes"], result["size_max_bytes"] = min(mins), max(maxs)
+        result["size_range"] = sizes[0]["size"] if len(sizes) == 1 else None
+        result["download_size"] = result["size_range"] or f"{_format_provider_bytes(min(mins))}–{_format_provider_bytes(max(maxs))}"
+    else:
+        result["download_size"] = None
+    with OLLAMA_LIBRARY_CACHE_LOCK:
+        OLLAMA_LIBRARY_CACHE[model_id] = (now + OLLAMA_LIBRARY_CACHE_SECONDS, result)
+    return result
+
+
+def _format_provider_bytes(value):
+    if value is None: return None
+    return f"{value / (1024 ** 3):.1f} GB" if value >= 1024 ** 3 else f"{value / (1024 ** 2):.0f} MB"
+
+
+def _ollama_model_list(payload):
+    if isinstance(payload, list): return payload
+    if not isinstance(payload, dict): return []
+    for key in ("models", "data", "value", "results"):
+        candidate = payload.get(key)
+        if isinstance(candidate, list): return candidate
+        if isinstance(candidate, dict):
+            for nested in ("models", "data", "value"):
+                if isinstance(candidate.get(nested), list): return candidate[nested]
+    return []
+
+
+def _marketplace_http():
+    return httpx.Client(timeout=httpx.Timeout(20.0, connect=7.0), follow_redirects=True,
+                        headers={"User-Agent": "LOCAL-AI-STUDIO/0.9 model-marketplace"})
+
+
+def _provider_http_error(provider, exc):
+    """Map provider failures to stable, actionable API errors without leaking credentials."""
+    if isinstance(exc, httpx.TimeoutException):
+        return HTTPException(status_code=504, detail={"code": "provider_timeout", "message": f"{provider} catalog timed out. Try again."})
+    if isinstance(exc, httpx.ConnectError):
+        return HTTPException(status_code=503, detail={"code": "provider_unavailable", "message": f"Cannot reach {provider}. Check your internet connection."})
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 404:
+            return HTTPException(status_code=502, detail={"code": "provider_endpoint_not_found", "message": f"The {provider} catalog endpoint returned 404."})
+        if status == 429:
+            return HTTPException(status_code=429, detail={"code": "provider_rate_limited", "message": f"{provider} is rate limiting catalog requests. Wait and retry."})
+        if status >= 500:
+            return HTTPException(status_code=502, detail={"code": "provider_server_error", "message": f"{provider} catalog returned HTTP {status}. Try again later."})
+        return HTTPException(status_code=502, detail={"code": "provider_request_failed", "message": f"{provider} rejected the catalog request (HTTP {status})."})
+    if isinstance(exc, (json.JSONDecodeError, ValueError)):
+        return HTTPException(status_code=502, detail={"code": "invalid_provider_response", "message": f"{provider} returned data in an unexpected format."})
+    return HTTPException(status_code=502, detail={"code": "provider_error", "message": f"{provider} catalog is temporarily unavailable."})
+
+
+@app.get("/marketplace/search")
+def marketplace_search(provider: str = "huggingface", q: str = Query(default="", max_length=200), task: str = Query(default="", max_length=100), limit: int = 24, refresh: bool = False):
+    limit = max(1, min(limit, 50))
+    try:
+        with _marketplace_http() as client:
+            if provider == "huggingface":
+                params = {"search": q, "limit": limit, "sort": "downloads", "direction": "-1"}
+                if task:
+                    params["pipeline_tag"] = task
+                response = client.get("https://huggingface.co/api/models", params=params)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+                    raise ValueError("Hugging Face returned an invalid model list.")
+                results = []
+                for item in payload:
+                    card = item.get("cardData") or {}
+                    tags = item.get("tags") or []
+                    results.append({"id": item.get("id"), "provider": "Hugging Face",
+                        "name": (item.get("id") or "").split("/")[-1], "author": (item.get("id") or "").split("/")[0],
+                        "description": card.get("description") or card.get("pretty_name") or "", "architecture": card.get("model_type") or item.get("config", {}).get("model_type") or "",
+                        "tasks": [item.get("pipeline_tag")] if item.get("pipeline_tag") else [], "license": card.get("license") or "Unspecified",
+                        "downloads": item.get("downloads"), "updated": item.get("lastModified"), "url": "https://huggingface.co/" + item.get("id", ""),
+                        "format": "GGUF" if "gguf" in tags else "Transformers", "installable": "gguf" in tags})
+                return {"provider": provider, "results": results}
+            if provider == "ollama":
+                response = client.get("https://ollama.com/search", params={"q": q})
+                response.raise_for_status()
+                if "<" not in response.text:
+                    raise ValueError("Ollama returned a non-HTML catalog response.")
+                parser = MarketplaceLinkParser(); parser.feed(response.text)
+                results, seen = [], set()
+                for href, title in parser.links:
+                    match = re.fullmatch(r"/library/([a-zA-Z0-9_.-]+)", href or "")
+                    if not match or match.group(1) in seen:
+                        continue
+                    name = match.group(1); seen.add(name)
+                    results.append({"id": name, "provider": "Ollama Library", "name": name, "author": "Ollama",
+                        "description": title if title.lower() != name.lower() else "", "tasks": [], "license": "See provider page",
+                        "url": "https://ollama.com/library/" + name, "format": "Ollama", "installable": True,
+                        "versions": ["latest"]})
+                    if len(results) >= limit: break
+                def enrich(index, item):
+                    try:
+                        metadata = _ollama_library_metadata(item["id"], refresh=refresh)
+                        item.update(metadata)
+                        item["description"] = metadata.get("description") or item["description"]
+                        item["tasks"] = metadata.get("capabilities") or []
+                        item["installable"] = not metadata.get("is_cloud")
+                    except Exception:
+                        item.update({"metadata_available": False, "download_size": None, "is_cloud": False})
+                    return index, item
+                with ThreadPoolExecutor(max_workers=min(6, max(1, len(results)))) as pool:
+                    futures = [pool.submit(enrich, index, item) for index, item in enumerate(results)]
+                    enriched = [future.result() for future in as_completed(futures)]
+                    results = [item for _, item in sorted(enriched, key=lambda pair: pair[0])]
+                return {"provider": provider, "results": results}
+            raise HTTPException(status_code=400, detail="Provider must be ollama or huggingface.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _provider_http_error(provider, exc) from exc
+
+
+@app.get("/marketplace/details")
+def marketplace_details(provider: str, model_id: str, refresh: bool = False):
+    if provider == "huggingface":
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", model_id):
+            raise HTTPException(status_code=400, detail="Invalid Hugging Face repository identifier.")
+        try:
+            with _marketplace_http() as client:
+                response = client.get(f"https://huggingface.co/api/models/{model_id}", params={"blobs": "true"})
+                response.raise_for_status(); item = response.json()
+                if not isinstance(item, dict): raise ValueError("Hugging Face returned invalid repository details.")
+                card = item.get("cardData") or {}
+                files = [{"name": f.get("rfilename"), "size": (f.get("lfs") or {}).get("size") or f.get("size"), "sha256": (f.get("lfs") or {}).get("oid")}
+                         for f in item.get("siblings", []) if f.get("rfilename", "").lower().endswith(".gguf")]
+                return {"id": model_id, "provider": "Hugging Face", "revision": item.get("sha") or "main", "license": card.get("license") or "Unspecified",
+                    "license_url": card.get("license_link"), "description": card.get("description") or "", "architecture": card.get("model_type") or "Unknown",
+                    "tasks": [item.get("pipeline_tag")] if item.get("pipeline_tag") else [], "context_length": card.get("context_length"), "files": files,
+                    "url": f"https://huggingface.co/{model_id}", "installable": bool(files), "runtime": "llama.cpp (GGUF only)" if files else None}
+        except Exception as exc:
+            raise _provider_http_error("Hugging Face", exc) from exc
+    if provider == "ollama":
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", model_id):
+            raise HTTPException(status_code=400, detail="Invalid Ollama model name.")
+        try:
+            metadata = _ollama_library_metadata(model_id, refresh=refresh)
+        except Exception as exc:
+            raise _provider_http_error("Ollama Library", exc) from exc
+        return {"id": model_id, "provider": "Ollama Library", "url": f"https://ollama.com/library/{model_id}",
+                "license": "See provider page", "runtime": "Ollama", "installable": not metadata.get("is_cloud"),
+                **metadata, "note": "Variant sizes and tags are sourced from the Ollama Library."}
+    raise HTTPException(status_code=400, detail="Unsupported provider.")
+
+
+@app.get("/marketplace/versions")
+def marketplace_versions(provider: str, model_id: str):
+    detail = marketplace_details(provider=provider, model_id=model_id)
+    return {"provider": provider, "model_id": model_id,
+            "versions": detail.get("versions", []), "files": detail.get("files", []),
+            "revision": detail.get("revision")}
+
+
+@app.get("/marketplace/providers")
+def marketplace_providers():
+    result = []
+    with _marketplace_http() as client:
+        for key, url in (("ollama", "https://ollama.com/search?q=qwen"),
+                         ("huggingface", "https://huggingface.co/api/models?limit=1")):
+            try:
+                response = client.get(url); response.raise_for_status()
+                result.append({"id": key, "status": "online"})
+            except Exception as exc:
+                err = _provider_http_error("Ollama Library" if key == "ollama" else "Hugging Face", exc)
+                result.append({"id": key, "status": "unavailable", "error": err.detail})
+    return {"providers": result}
+
+
+class MarketplaceInstall(BaseModel):
+    provider: str
+    model_id: str = Field(min_length=1, max_length=250)
+    version: str = Field(min_length=1, max_length=500)
+    runtime: str
+    filename: str | None = None
+    revision: str | None = None
+
+
+MARKETPLACE_JOBS = {}
+MARKETPLACE_JOB_CANCEL = {}
+MARKETPLACE_JOB_KEYS = {}
+MARKETPLACE_ACTIVE_INSTALLS = {}
+MARKETPLACE_JOB_LOCK = threading.Lock()
+MODEL_STORAGE_DIR = Path(os.environ.get("LOCAL_AI_MODEL_DIR", str(DATA_ROOT / "models"))).expanduser()
+
+
+def _update_market_job(job_id, **updates):
+    with MARKETPLACE_JOB_LOCK:
+        MARKETPLACE_JOBS[job_id].update(updates)
+        MARKETPLACE_JOBS[job_id]["updated_at"] = get_time()
+        snapshot = dict(MARKETPLACE_JOBS[job_id])
+        if snapshot.get("status") in {"completed", "failed", "cancelled"}:
+            key = MARKETPLACE_JOB_KEYS.pop(job_id, None)
+            if key: MARKETPLACE_ACTIVE_INSTALLS.pop(key, None)
+    try:
+        with get_connection() as db:
+            db.execute("UPDATE model_download_jobs SET status=?,downloaded_bytes=?,total_bytes=?,destination=?,error=?,message=?,speed_bytes_per_second=?,updated_at=? WHERE id=?",
+                       (snapshot.get("status", "queued"), snapshot.get("downloaded_bytes", 0), snapshot.get("total_bytes"),
+                        snapshot.get("destination", ""), snapshot.get("error", ""), snapshot.get("message", ""),
+                        snapshot.get("speed_bytes_per_second", 0), snapshot["updated_at"], job_id))
+    except sqlite3.Error:
+        pass
+
+
+def _run_marketplace_install(job_id, request_data):
+    provider, model_id, version, runtime = (request_data.provider, request_data.model_id,
+                                            request_data.version, request_data.runtime)
+    try:
+        if provider == "ollama":
+            if runtime != "ollama": raise ValueError("Ollama catalog models must be installed with Ollama.")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", model_id): raise ValueError("Invalid Ollama model name.")
+            local = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+            if ":" in version and not version.startswith(model_id + ":"):
+                raise ValueError("The selected tag must belong to the selected Ollama model.")
+            exact_tag = version if ":" in version else f"{model_id}:{version}"
+            with _marketplace_http() as client:
+                tags = client.get(f"{local}/api/tags"); tags.raise_for_status()
+                existing_tag = next((m for m in _ollama_model_list(tags.json()) if m.get("name", m.get("model")) == exact_tag), None)
+                if existing_tag:
+                    _update_market_job(job_id, status="verifying", downloaded_bytes=int(existing_tag.get("size") or 0), total_bytes=int(existing_tag.get("size") or 0), message="Already present in Ollama; verifying registry")
+                else:
+                    _update_market_job(job_id, status="downloading")
+                    layer_progress = {}
+                    with client.stream("POST", f"{local}/api/pull", json={"name": exact_tag, "stream": True}, timeout=None) as response:
+                        response.raise_for_status()
+                        for line in response.iter_lines():
+                            if MARKETPLACE_JOB_CANCEL[job_id].is_set(): raise InterruptedError("Cancelled by user")
+                            if not line: continue
+                            progress = json.loads(line)
+                            layer = str(progress.get("digest") or progress.get("status") or "transfer")
+                            layer_progress[layer] = (int(progress.get("completed") or 0), int(progress.get("total") or 0))
+                            done = sum(value[0] for value in layer_progress.values())
+                            total = sum(value[1] for value in layer_progress.values())
+                            _update_market_job(job_id, downloaded_bytes=done, total_bytes=total or None,
+                                               message=progress.get("status", "Pulling model"),
+                                               status="verifying" if progress.get("status") == "success" else "downloading")
+                verify = client.get(f"{local}/api/tags"); verify.raise_for_status()
+                installed = next((m for m in _ollama_model_list(verify.json()) if m.get("name", m.get("model")) == exact_tag), None)
+                if not installed: raise RuntimeError("Ollama pull finished but the model is not present in its model list.")
+                now = get_time(); digest = installed.get("digest", ""); mid = "ollama-" + hashlib.sha256(("ollama:" + exact_tag.casefold()).encode()).hexdigest()[:24]
+                meta = {"ollama_name": exact_tag, "digest": digest, "is_cloud": exact_tag.casefold().endswith(":cloud"), "capabilities": infer_model_capabilities(exact_tag, installed.get("details") or {}), "capabilities_inferred": True}
+                with get_connection() as db:
+                    d = installed.get("details") or {}
+                    db.execute("""INSERT INTO model_registry(id,name,family,version,format,runtime,source_type,file_path,file_size_bytes,sha256,status,metadata_json,first_seen,last_seen,created_at,updated_at,installed_at,installed_at_source)
+                    VALUES(?,?,?,?,?,'ollama','ollama',NULL,?,?, 'installed',?,?,?,?,?,?, 'app_recorded') ON CONFLICT(id) DO UPDATE SET name=excluded.name,file_size_bytes=excluded.file_size_bytes,sha256=excluded.sha256,status='installed',metadata_json=excluded.metadata_json,last_seen=excluded.last_seen,updated_at=excluded.updated_at,installed_at=COALESCE(model_registry.installed_at,excluded.installed_at),installed_at_source=COALESCE(model_registry.installed_at_source,excluded.installed_at_source)""",
+                    (mid, exact_tag, d.get("family", "Unknown"), version, d.get("format", "ollama"), int(installed.get("size") or 0), digest, json.dumps(meta), now, now, now, now, now))
+            verified_size = int(installed.get("size") or 0)
+            _update_market_job(job_id, status="completed", downloaded_bytes=verified_size, total_bytes=verified_size or None,
+                               is_cloud_registration=exact_tag.casefold().endswith(":cloud"),
+                               message="Cloud registration verified" if exact_tag.casefold().endswith(":cloud") else "Installed and verified")
+            return
+        if provider != "huggingface" or runtime != "llama.cpp":
+            raise ValueError("Hugging Face installation currently supports GGUF artifacts for llama.cpp only.")
+        if not request_data.filename or Path(request_data.filename).name != request_data.filename or not request_data.filename.lower().endswith(".gguf"):
+            raise ValueError("Select one GGUF file from the repository. Other formats are not installable through this adapter.")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", model_id): raise ValueError("Invalid repository identifier.")
+        revision = request_data.revision or "main"
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", revision): raise ValueError("Invalid repository revision.")
+        url = f"https://huggingface.co/{model_id}/resolve/{revision}/{request_data.filename}"
+        sha = hashlib.sha256(); count = 0; started = time.monotonic()
+        with _marketplace_http() as client:
+            details_response = client.get(f"https://huggingface.co/api/models/{model_id}", params={"blobs": "true", "revision": revision})
+            details_response.raise_for_status()
+            repo_details = details_response.json()
+            repo_revision = repo_details.get("sha")
+            expected_digest = None
+            expected_artifact_size = None
+            for sibling in repo_details.get("siblings", []):
+                if sibling.get("rfilename") == request_data.filename:
+                    lfs = sibling.get("lfs") or {}
+                    raw_size = lfs.get("size") or sibling.get("size")
+                    if isinstance(raw_size, int) and raw_size > 0: expected_artifact_size = raw_size
+                    oid = lfs.get("oid", "")
+                    if re.fullmatch(r"[a-fA-F0-9]{64}", oid): expected_digest = oid.lower()
+                    break
+            if revision == "main" and repo_revision:
+                revision = repo_revision
+                url = f"https://huggingface.co/{model_id}/resolve/{revision}/{request_data.filename}"
+            with get_connection() as db:
+                existing = db.execute("SELECT id FROM model_registry WHERE json_extract(metadata_json,'$.repository')=? AND json_extract(metadata_json,'$.revision')=? AND json_extract(metadata_json,'$.filename')=? AND status IN ('downloaded','installed') LIMIT 1",
+                                      (model_id, revision, request_data.filename)).fetchone()
+            if existing:
+                _update_market_job(job_id, status="completed", downloaded_bytes=0, total_bytes=0, message="This exact repository revision and artifact are already registered")
+                return
+            MODEL_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+            revision_dir = re.sub(r"[^A-Za-z0-9._-]", "_", revision)
+            destination_dir = (MODEL_STORAGE_DIR / "huggingface" / model_id.replace("/", "__") / revision_dir).resolve()
+            root = (MODEL_STORAGE_DIR / "huggingface").resolve()
+            if root not in destination_dir.parents: raise ValueError("Unsafe model destination.")
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            final_path = (destination_dir / request_data.filename).resolve()
+            if destination_dir not in final_path.parents: raise ValueError("Unsafe model filename.")
+            if final_path.exists():
+                raise FileExistsError("A file already exists at this exact repository revision destination. It was left untouched.")
+            partial_path = final_path.with_suffix(final_path.suffix + ".partial")
+            with client.stream("GET", url, timeout=None) as response:
+                response.raise_for_status()
+                total = int(response.headers.get("content-length") or expected_artifact_size or 0)
+                free = shutil.disk_usage(MODEL_STORAGE_DIR).free
+                if total and total > free:
+                    raise ValueError(f"Not enough free disk space: need {total} bytes, have {free} bytes.")
+                _update_market_job(job_id, status="downloading", destination=str(final_path), total_bytes=total)
+                with open(partial_path, "wb") as output:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        if MARKETPLACE_JOB_CANCEL[job_id].is_set(): raise InterruptedError("Cancelled by user")
+                        output.write(chunk); sha.update(chunk); count += len(chunk)
+                        _update_market_job(job_id, downloaded_bytes=count, total_bytes=total,
+                                           speed_bytes_per_second=int(count / max(time.monotonic() - started, .1)))
+        _update_market_job(job_id, status="verifying")
+        actual_digest = sha.hexdigest()
+        if expected_digest and actual_digest != expected_digest:
+            partial_path.unlink(missing_ok=True)
+            raise ValueError("Downloaded file checksum does not match the provider's published SHA-256.")
+        os.replace(partial_path, final_path)
+        verified_size = final_path.stat().st_size
+        if verified_size != count:
+            raise RuntimeError("Downloaded file size changed during verification; registry was not updated.")
+        revision_hash = revision if re.fullmatch(r"[a-f0-9]{40}", revision) else None
+        now = get_time(); digest = sha.hexdigest(); mid = "hf-" + hashlib.sha256(f"{model_id}@{revision}/{request_data.filename}".encode()).hexdigest()[:24]
+        meta = {"repository": model_id, "revision": revision, "filename": request_data.filename, "verification": "sha256-computed; provider checksum not independently confirmed"}
+        with get_connection() as db:
+            db.execute("""INSERT INTO model_registry(id,name,family,version,format,runtime,source_type,file_path,file_size_bytes,sha256,status,metadata_json,first_seen,last_seen,created_at,updated_at,installed_at,installed_at_source)
+            VALUES(?,?,? ,?,'GGUF','llama.cpp','huggingface',?,?,?,'downloaded',?,?,?,?,?,?, 'app_recorded') ON CONFLICT(id) DO UPDATE SET file_path=excluded.file_path,file_size_bytes=excluded.file_size_bytes,sha256=excluded.sha256,status='downloaded',metadata_json=excluded.metadata_json,last_seen=excluded.last_seen,updated_at=excluded.updated_at,installed_at=COALESCE(model_registry.installed_at,excluded.installed_at),installed_at_source=COALESCE(model_registry.installed_at_source,excluded.installed_at_source)""",
+            (mid, Path(model_id).name, model_id.split('/')[0], revision_hash or revision, str(final_path), verified_size, digest, json.dumps(meta), now, now, now, now, now))
+        _update_market_job(job_id, status="completed", downloaded_bytes=verified_size, total_bytes=verified_size, checksum=digest, verification="provider SHA-256 verified" if expected_digest else "SHA-256 computed; provider checksum unavailable", revision=revision, message="Artifact downloaded, verified, and registered; runtime loading must be configured separately")
+    except InterruptedError as exc:
+        _update_market_job(job_id, status="cancelled", error=str(exc))
+    except Exception as exc:
+        _update_market_job(job_id, status="failed", error=str(exc)[:500])
+
+
+@app.post("/marketplace/install", status_code=202)
+def marketplace_install(data: MarketplaceInstall):
+    job_id = str(uuid.uuid4()); now = get_time()
+    if data.provider not in {"ollama", "huggingface"}:
+        raise HTTPException(status_code=400, detail="Provider must be ollama or huggingface.")
+    if data.provider == "ollama" and (data.version.casefold().endswith(":cloud") or data.version.casefold().endswith("-cloud")):
+        raise HTTPException(status_code=409, detail="This Ollama variant is cloud-hosted and has no local model weights to download.")
+    if data.provider == "ollama":
+        try:
+            metadata = _ollama_library_metadata(data.model_id)
+            selected = next((variant for variant in metadata.get("variants", []) if variant["name"] == data.version), None)
+            if metadata.get("is_cloud") or (selected and selected.get("cloud")):
+                raise HTTPException(status_code=409, detail="This Ollama variant is cloud-hosted and has no local model weights to download.")
+        except HTTPException: raise
+        except Exception:
+            # A missing public metadata page must not turn an unknown size into a
+            # cloud classification. The exact requested local tag is still verified
+            # against the Ollama runtime after pull.
+            pass
+    install_key = "|".join((data.provider, data.model_id.casefold(), data.version.casefold(), (data.filename or "").casefold()))
+    record = {"id": job_id, "provider": data.provider, "model_name": data.model_id, "version": data.version, "status": "queued", "downloaded_bytes": 0, "total_bytes": None, "destination": "Ollama-managed" if data.provider == "ollama" else str(MODEL_STORAGE_DIR), "error": "", "message": "Queued", "created_at": now, "updated_at": now}
+    with MARKETPLACE_JOB_LOCK:
+        active_id = MARKETPLACE_ACTIVE_INSTALLS.get(install_key)
+        if active_id:
+            return {**MARKETPLACE_JOBS[active_id], "already_active": True}
+        MARKETPLACE_JOBS[job_id] = record; MARKETPLACE_JOB_CANCEL[job_id] = threading.Event()
+        MARKETPLACE_JOB_KEYS[job_id] = install_key
+        MARKETPLACE_ACTIVE_INSTALLS[install_key] = job_id
+    with get_connection() as db:
+        db.execute("INSERT INTO model_download_jobs(id,provider,model_name,version,status,destination,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (job_id, data.provider, data.model_id, data.version, "queued", record["destination"], now, now))
+    threading.Thread(target=_run_marketplace_install, args=(job_id, data), daemon=True).start()
+    return record
+
+
+@app.get("/marketplace/downloads")
+def marketplace_downloads():
+    with get_connection() as db:
+        rows = [dict(row) for row in db.execute("SELECT * FROM model_download_jobs ORDER BY created_at DESC").fetchall()]
+    with MARKETPLACE_JOB_LOCK:
+        live = {item["id"]: item for item in MARKETPLACE_JOBS.values()}
+    for row in rows:
+        if row["id"] in live:
+            row.update(live[row["id"]])
+        else:
+            row.update({"message": row.get("message") or row.get("error") or row["status"], "speed_bytes_per_second": row.get("speed_bytes_per_second") or 0})
+    return rows
+
+
+@app.delete("/marketplace/downloads/{job_id}")
+def delete_download_history(job_id: str):
+    with MARKETPLACE_JOB_LOCK:
+        live = MARKETPLACE_JOBS.get(job_id)
+        if live and live.get("status") in {"queued", "downloading", "verifying", "installing"}:
+            raise HTTPException(status_code=409, detail="Cancel or finish this active download before deleting its history.")
+    with get_connection() as db:
+        row = db.execute("SELECT status FROM model_download_jobs WHERE id=?", (job_id,)).fetchone()
+        if row and row["status"] in {"queued", "downloading", "verifying", "installing"}:
+            raise HTTPException(status_code=409, detail="Cancel or finish this active download before deleting its history.")
+        cursor = db.execute("DELETE FROM model_download_jobs WHERE id=?", (job_id,))
+    if cursor.rowcount == 0: raise HTTPException(status_code=404, detail="Download history entry not found.")
+    with MARKETPLACE_JOB_LOCK:
+        MARKETPLACE_JOBS.pop(job_id, None); MARKETPLACE_JOB_CANCEL.pop(job_id, None)
+    return {"deleted": True, "id": job_id}
+
+
+@app.delete("/marketplace/downloads")
+def clear_download_history():
+    with MARKETPLACE_JOB_LOCK:
+        active = [job_id for job_id, job in MARKETPLACE_JOBS.items() if job.get("status") in {"queued", "downloading", "verifying", "installing"}]
+        if active: raise HTTPException(status_code=409, detail="Cancel or finish active downloads before clearing history.")
+    with get_connection() as db:
+        active_rows = db.execute("SELECT COUNT(*) AS count FROM model_download_jobs WHERE status IN ('queued','downloading','verifying','installing')").fetchone()
+        if active_rows["count"]: raise HTTPException(status_code=409, detail="Cancel or finish active downloads before clearing history.")
+        db.execute("DELETE FROM model_download_jobs")
+    with MARKETPLACE_JOB_LOCK:
+        MARKETPLACE_JOBS.clear(); MARKETPLACE_JOB_CANCEL.clear(); MARKETPLACE_JOB_KEYS.clear()
+    return {"deleted": True}
+
+
+@app.post("/marketplace/downloads/{job_id}/cancel")
+def marketplace_cancel(job_id: str):
+    with MARKETPLACE_JOB_LOCK:
+        if job_id not in MARKETPLACE_JOBS: raise HTTPException(status_code=404, detail="Download not found.")
+        MARKETPLACE_JOB_CANCEL[job_id].set()
+        return {"id": job_id, "status": "cancelling"}
 
 # --------------------------------------------------
 # CREATE CONVERSATION
@@ -1148,7 +2122,231 @@ async def current_model():
         "available": model_id is not None
     }
 
+# --------------------------------------------------
+# CODING AI MODEL AND ASSISTANT
+# --------------------------------------------------
 
+class CodingAssistantRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=100)
+    prompt: str = Field(min_length=1, max_length=12000)
+    relative_path: str = Field(default="", max_length=4096)
+    code: str = Field(default="", max_length=50000)
+    selection: str | None = Field(default=None, max_length=20000)
+
+
+async def coding_model_health():
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{CODING_LLAMA_URL}/v1/models")
+            if response.status_code == 200:
+                payload = response.json()
+                models = payload.get("data", [])
+                model_id = models[0].get("id") if models else None
+                return True, model_id
+    except (httpx.RequestError, ValueError):
+        pass
+
+    return False, None
+
+
+@app.get("/coding/model/status")
+async def coding_model_status():
+    global CODING_MODEL_PROCESS
+
+    available, model_id = await coding_model_health()
+
+    process_running = (
+        CODING_MODEL_PROCESS is not None
+        and CODING_MODEL_PROCESS.poll() is None
+    )
+
+    return {
+        "available": available,
+        "process_running": available or process_running,
+        "model_id": model_id,
+        "model_path": str(CODING_MODEL_PATH),
+        "model_exists": CODING_MODEL_PATH.exists(),
+        "runtime_url": CODING_LLAMA_URL,
+        "message": (
+            "Coding model is ready."
+            if available
+            else "Coding model is not responding."
+        )
+    }
+
+
+@app.post("/coding/model/start")
+async def start_coding_model():
+    global CODING_MODEL_PROCESS
+
+    available, _ = await coding_model_health()
+
+    if available:
+        return {
+            "started": False,
+            "message": "Coding model is already running."
+        }
+
+    with CODING_MODEL_LOCK:
+        if CODING_MODEL_PROCESS is not None:
+            if CODING_MODEL_PROCESS.poll() is None:
+                return {
+                    "started": False,
+                    "message": "Coding model is already starting."
+                }
+            CODING_MODEL_PROCESS = None
+
+        if not LLAMA_SERVER_EXE.exists():
+            raise HTTPException(500, "llama-server.exe was not found.")
+
+        if not CODING_MODEL_PATH.exists():
+            raise HTTPException(404, "Coding GGUF model file was not found.")
+
+        try:
+            CODING_MODEL_PROCESS = subprocess.Popen(
+                [
+                    str(LLAMA_SERVER_EXE),
+                    "--model", str(CODING_MODEL_PATH),
+                    "--host", "127.0.0.1",
+                    "--port", "8082",
+                    "--ctx-size", "4096",
+                    "--threads", "4",
+                    "--n-gpu-layers", "0",
+                    "--parallel", "1"
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        except OSError as exc:
+            raise HTTPException(500, f"Unable to start coding model: {exc}")
+
+    return {
+        "started": True,
+        "message": "Coding model server is starting."
+    }
+
+
+@app.post("/coding/model/stop")
+async def stop_coding_model():
+    global CODING_MODEL_PROCESS
+
+    with CODING_MODEL_LOCK:
+        process = CODING_MODEL_PROCESS
+
+        if process is None:
+            available, _ = await coding_model_health()
+
+            if available:
+                return {
+                    "stopped": False,
+                    "message": "The model was started externally. Stop it using Ctrl+C in its PowerShell window."
+                }
+
+            return {
+                "stopped": False,
+                "message": "Coding model is not running."
+            }
+
+        if process.poll() is None:
+            process.terminate()
+
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+        CODING_MODEL_PROCESS = None
+
+    return {
+        "stopped": True,
+        "message": "Coding model stopped."
+    }
+
+
+@app.post("/coding/assistant")
+async def coding_assistant(data: CodingAssistantRequest):
+    available, model_id = await coding_model_health()
+
+    if not available:
+        raise HTTPException(
+            503,
+            "Coding model is not running. Start Qwen2.5-Coder first."
+        )
+
+    system_prompt = """
+You are the Coding AI assistant inside Local AI Studio.
+
+Help the user understand, debug, explain, refactor and improve code.
+Use the supplied source code and selection as context.
+Give practical, accurate answers.
+When suggesting code changes, provide complete replacement snippets
+for the relevant section and explain where they belong.
+Never claim that you modified files or executed commands.
+All changes must be reviewed and approved by the user.
+"""
+
+    user_prompt = f"""
+Task: {data.task}
+
+User request:
+{data.prompt}
+
+File path:
+{data.relative_path or "Not specified"}
+
+Current file code:
+{data.code or "No code supplied"}
+
+Selected code:
+{data.selection or "No selection"}
+"""
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                f"{CODING_LLAMA_URL}/v1/chat/completions",
+                json={
+                    "model": model_id or CODING_MODEL_NAME,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 1200,
+                    "stream": False
+                }
+            )
+
+            response.raise_for_status()
+            result = response.json()
+
+        content = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        if not content.strip():
+            raise HTTPException(502, "Coding model returned an empty response.")
+
+        return {
+            "content": content.strip(),
+            "task": data.task,
+            "proposal": True,
+            "model": CODING_MODEL_NAME
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Coding model response timed out.")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            502,
+            f"Coding model request failed: {exc.response.text[:500]}"
+        )
+    except httpx.RequestError:
+        raise HTTPException(503, "Unable to connect to the coding model.")
 # --------------------------------------------------
 # MESSAGE FEEDBACK
 # --------------------------------------------------
@@ -1659,7 +2857,7 @@ def stop_coding_debug(session_id: str):
 
 
 # --------------------------------------------------
-# PHASE 7.1 — DOCUMENT UPLOAD AND MANAGEMENT
+# PHASE 7.1 â€” DOCUMENT UPLOAD AND MANAGEMENT
 # --------------------------------------------------
 
 DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
@@ -1950,7 +3148,7 @@ def delete_document(document_id: str):
 
 
 # --------------------------------------------------
-# PHASE 7.3 — DOCUMENT STUDY, GROUNDED Q&A AND STUDY MATERIALS
+# PHASE 7.3 â€” DOCUMENT STUDY, GROUNDED Q&A AND STUDY MATERIALS
 # --------------------------------------------------
 
 class DocumentAskRequest(BaseModel):
@@ -2209,23 +3407,189 @@ async def generate_document_questions(document_id: str, data: DocumentQuestionRe
     return {"document_id": document_id, "filename": row["original_name"], "questions": normalized}
 
 
+def _normalize_document_flashcards(raw_cards, requested_count: int):
+    """
+    Normalize common local-LLM flashcard response formats.
+    Accepts front/back and question/answer field names.
+    """
+    if isinstance(raw_cards, dict):
+        for key in ("flashcards", "cards", "items", "results"):
+            if isinstance(raw_cards.get(key), list):
+                raw_cards = raw_cards[key]
+                break
+
+    if not isinstance(raw_cards, list):
+        return []
+
+    normalized = []
+
+    for card in raw_cards:
+        if not isinstance(card, dict):
+            continue
+
+        front = (
+            card.get("front")
+            or card.get("question")
+            or card.get("term")
+            or card.get("prompt")
+        )
+
+        back = (
+            card.get("back")
+            or card.get("answer")
+            or card.get("definition")
+            or card.get("explanation")
+        )
+
+        front = str(front or "").strip()
+        back = str(back or "").strip()
+
+        if not front or not back:
+            continue
+
+        page = card.get("page")
+        if isinstance(page, str):
+            match = re.search(r"\d+", page)
+            page = int(match.group()) if match else None
+        elif not isinstance(page, int) or isinstance(page, bool):
+            page = None
+
+        normalized.append({
+            "front": front,
+            "back": back,
+            "page": page
+        })
+
+        if len(normalized) >= requested_count:
+            break
+
+    return normalized
+
+
 @app.post("/documents/{document_id}/flashcards")
-async def generate_document_flashcards(document_id: str, data: DocumentQuestionRequest):
+async def generate_document_flashcards(
+    document_id: str,
+    data: DocumentQuestionRequest
+):
     row, text = _get_study_document(document_id)
+
     passages = _document_passages(text, max_chars=1400)
-    content = "\n\n".join(f"[Page {p['page']}] {p['text']}" for p in passages)[:18000]
-    cards = await _document_json_completion(
-        "Create flashcards only from the document. Return a JSON array with front, back, page. Every card must have a useful non-empty front and back. No markdown fences. Do not add outside facts.",
-        f"Create {data.count} concise study flashcards from {row['original_name']}.\n\n{content}",
-        max_tokens=min(2800, 250 + data.count * 120)
+
+    content = "\n\n".join(
+        f"[Page {p['page']}]\n{p['text']}"
+        for p in passages
+    )[:18000]
+
+    system_prompt = """
+You are an expert study-material generator.
+
+Create flashcards using ONLY the supplied document.
+Do not use outside knowledge or invent facts.
+
+Return ONLY a valid JSON array.
+Every array item must have exactly these fields:
+{
+  "front": "A concise question or term",
+  "back": "A concise, accurate answer",
+  "page": 1
+}
+
+Rules:
+1. Every card must have a non-empty front and back.
+2. Ask one clear question per card.
+3. Cover important definitions, concepts, facts, processes and comparisons.
+4. Avoid duplicate or repetitive cards.
+5. Keep questions and answers concise but meaningful.
+6. Preserve technical terminology from the document.
+7. Use the correct source page number when identifiable.
+8. If the page is unknown, use null.
+9. Do not include explanations outside the JSON array.
+10. Do not use Markdown code fences.
+"""
+
+    user_prompt = f"""
+Create exactly {data.count} useful study flashcards.
+
+Document: {row['original_name']}
+Requested difficulty: {data.difficulty}
+
+Document content:
+{content}
+"""
+
+    max_tokens = min(2800, max(900, 400 + data.count * 180))
+
+    # First generation attempt
+    raw_cards = await _document_json_completion(
+        system_prompt,
+        user_prompt,
+        max_tokens=max_tokens
     )
-    if isinstance(cards, dict): cards = cards.get("flashcards", [])
-    if not isinstance(cards, list):
-        raise HTTPException(status_code=502, detail="The local model returned JSON, but it was not a flashcard array.")
-    cards = [c for c in cards if isinstance(c, dict) and str(c.get("front", "")).strip() and str(c.get("back", "")).strip()]
+    print("\n========== FLASHCARD DEBUG ==========")
+    print("MODEL RAW/PARSED RESPONSE:")
+    print(repr(cards))
+    print("RESPONSE TYPE:", type(cards))
+    print("=====================================\n")
+
+    cards = _normalize_document_flashcards(
+        raw_cards,
+        data.count
+    )
+
+    # Retry once if the first response contains no usable cards.
     if not cards:
-        raise HTTPException(status_code=502, detail="The model returned no usable flashcards. Try again with fewer cards.")
-    return {"document_id": document_id, "flashcards": cards[:data.count]}
+        retry_prompt = f"""
+The previous response did not contain usable flashcards.
+
+Generate exactly {data.count} flashcards from the document below.
+
+Return ONLY a JSON array.
+Use precisely these keys for every card:
+front, back, page
+
+Example format:
+[
+  {{
+    "front": "What is the main concept?",
+    "back": "The explanation given in the document.",
+    "page": 1
+  }}
+]
+
+Do not use question/answer keys.
+Do not include Markdown or additional text.
+
+Document:
+{content}
+"""
+
+        raw_cards = await _document_json_completion(
+            system_prompt,
+            retry_prompt,
+            max_tokens=max_tokens
+        )
+
+        cards = _normalize_document_flashcards(
+            raw_cards,
+            data.count
+        )
+
+    if not cards:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The local model could not generate usable flashcards "
+                "after two attempts. Try a shorter document or fewer cards."
+            )
+        )
+
+    return {
+        "document_id": document_id,
+        "filename": row["original_name"],
+        "flashcards": cards,
+        "generated_count": len(cards),
+        "requested_count": data.count
+    }
 
 
 @app.post("/documents/{document_id}/concept-map")

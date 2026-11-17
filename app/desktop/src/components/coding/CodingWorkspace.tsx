@@ -755,7 +755,7 @@ export default function CodingWorkspace({
               <span className="ide-model-state">{codingModelStatus?.available ? "MODEL READY" : "MODEL UNLOADED"}</span>
             </div>
             <div className="ide-model-control">
-              <div><Cpu size={15}/><span>Qwen2.5-Coder 3B</span></div>
+              <div><Cpu size={15}/><span>Qwen2.5-Coder 7B</span></div>
               <button onClick={() => void toggleCodingModel()} disabled={modelBusy || !codingModelStatus?.model_exists}>
                 {modelBusy ? "Please wait…" : codingModelStatus?.available || codingModelStatus?.process_running ? "Unload model" : "Load model"}
               </button>
