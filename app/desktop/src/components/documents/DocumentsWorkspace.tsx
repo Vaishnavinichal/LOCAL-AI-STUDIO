@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FileText, FileUp, File as FileIcon, Trash2, RefreshCw, ShieldCheck, Search, ScanText, Loader2 } from "lucide-react";
 import { documentsApi, documentStudyApi, type LocalDocument, type StudyQuestion, type StudyFlashcard, type StudyGlossaryItem, type StudyMaterial } from "../../services/api";
+import { subscribeToNativeFileDrop } from "../../services/platform";
 import "./documents.css";
 
 interface Props { onError: (message: string) => void; onSuccess: (message: string) => void; }
@@ -56,19 +56,18 @@ export default function DocumentsWorkspace({ onError, onSuccess }: Props) {
   }, [onError]);
   useEffect(() => { void refresh(); }, [refresh]);
 
-  // Tauri's native file-drop event is required for OS files dropped onto a WebView.
-  // DOM drag/drop alone is not consistently delivered by Windows WebView2.
+  // Tauri uses native OS paths; browsers continue to use the DOM FileList drop handler.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    void getCurrentWebview().onDragDropEvent(async (event) => {
-      if (event.payload.type === "enter" || event.payload.type === "over") {
+    void subscribeToNativeFileDrop(async event => {
+      if (event.type === "enter" || event.type === "over") {
         setDragActive(true);
-      } else if (event.payload.type === "leave") {
+      } else if (event.type === "leave") {
         setDragActive(false);
-      } else if (event.payload.type === "drop") {
+      } else if (event.type === "drop") {
         setDragActive(false);
-        const paths = event.payload.paths || [];
+        const paths = event.paths;
         if (!paths.length) return;
         setUploading(true);
         let uploaded = 0;

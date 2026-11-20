@@ -5,7 +5,6 @@ import {
   Search,
   FileText,
   Images,
-  Settings,
   PanelLeftClose,
   Code2,
   FolderKanban,
@@ -16,12 +15,16 @@ import {
   Pencil,
   RotateCcw,
   X,
-  Settings2
+  Settings2,
+  Sun,
+  Moon,
 } from "lucide-react";
 
 import type { Conversation } from "../../types/chat";
 
 interface SidebarProps {
+  theme: "dark" | "light";
+  onToggleTheme: () => void;
   collapsed: boolean;
   onToggle: () => void;
   onNewChat: () => void;
@@ -47,6 +50,8 @@ interface SidebarProps {
 
 export default function Sidebar(props: SidebarProps) {
   const {
+    theme,
+    onToggleTheme,
     collapsed,
     onToggle,
     onNewChat,
@@ -128,6 +133,9 @@ export default function Sidebar(props: SidebarProps) {
         >
           <Settings2 size={18} />
           <span>Model Manager</span>
+        </button>
+        <button className="icon-button" onClick={onToggleTheme} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}>
+          {theme === "dark" ? <Sun size={19}/> : <Moon size={19}/>}
         </button>
       </aside>
     );
@@ -397,13 +405,9 @@ export default function Sidebar(props: SidebarProps) {
           {showTrash ? "Back to Chats" : "Trash"}
         </button>
 
-        <button
-          className="nav-item"
-          type="button"
-          disabled
-        >
-          <Settings size={17} />
-          Settings
+        <button className="nav-item" type="button" onClick={onToggleTheme} title="Switch application color theme">
+          {theme === "dark" ? <Sun size={17}/> : <Moon size={17}/>}
+          {theme === "dark" ? "Light mode" : "Dark mode"}
         </button>
 
         {/* Profile */}

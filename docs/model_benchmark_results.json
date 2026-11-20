@@ -1,0 +1,394 @@
+{
+  "measured_at": "2026-11-17T05:54:56.366382+00:00",
+  "runtime": "Ollama (localhost)",
+  "discovered_live_models": [
+    "deepseek-v4.1-flash:1017-cloud",
+    "embeddinggemma:latest",
+    "nomic-embed-text:latest",
+    "qwen2.5-coder:7b",
+    "qwen2.5:3b",
+    "qwen2.5:7b",
+    "qwen3-vl:2b",
+    "smollm2:135m"
+  ],
+  "benchmarks": [
+    {
+      "id": "0271a9ac-18b3-4ba9-9c08-a2c9f9ddd696",
+      "model_id": "ollama-357c53fb659c5076de1d65cc",
+      "model_name": "qwen2.5:3b",
+      "runtime": "ollama",
+      "results": {
+        "embedding": {
+          "status": "not_applicable",
+          "reason": "Completion model; semantic embedding test is run for embedding-assigned models."
+        },
+        "code_generation": {
+          "status": "success",
+          "response_ms": 17255.9,
+          "json_valid": null,
+          "instruction_compliant": true,
+          "generated_tokens": 132,
+          "tokens_per_second": 11.52,
+          "token_rate_measured": true,
+          "preview": "Certainly! Below is a Python function named `clamp` that takes three parameters: `value`, `low`, and `high`. The function returns the `value` bounded by `low` and `high`. If the `value` is less than `low`, it returns `low`. If the `value` is greater than `high`, it returns `high`. Otherwise, it returns the `value` itself.\n\n```python\ndef clamp(value, low, high):\n    return max(low, min(value, high)"
+        },
+        "code_explanation": {
+          "status": "success",
+          "response_ms": 6929.9,
+          "json_valid": null,
+          "instruction_compliant": true,
+          "generated_tokens": 35,
+          "tokens_per_second": 11.83,
+          "token_rate_measured": true,
+          "preview": "The Python expression `[x*x for x in values if x > 0]` creates a list of the squares of all positive numbers in the `values` iterable."
+        },
+        "requirement_analysis": {
+          "status": "success",
+          "response_ms": 28020.4,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 264,
+          "tokens_per_second": 10.9,
+          "token_rate_measured": true,
+          "preview": "Here is a JSON structure that you can use for your request to add a health endpoint that returns a JSON status:\n\n```json\n{\n  \"objective\": \"Create a health endpoint that returns a JSON status indicating the system's health status.\",\n  \"requirements\": [\n    {\n      \"requirement\": \"The endpoint should be accessible via HTTP GET method.\",\n      \"details\": \"The endpoint should be accessible at the URL "
+        },
+        "planning": {
+          "status": "success",
+          "response_ms": 23079.5,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 211,
+          "tokens_per_second": 10.95,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"tasks\": [\n    {\n      \"description\": \"Create a new file for the health endpoint implementation.\",\n      \"steps\": [\n        \"Create a new file named `health_endpoint.go` in the appropriate directory (e.g., `api` or `controllers`).\",\n        \"Initialize the file with basic Go syntax, including package declaration and any necessary imports.\"\n      ]\n    },\n    {\n      \"description\": \"Imp"
+        },
+        "structured_output": {
+          "status": "success",
+          "response_ms": 5458.2,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 12,
+          "tokens_per_second": 10.51,
+          "token_rate_measured": true,
+          "preview": "{\"valid\": true, \"count\": 3}"
+        },
+        "tool_instruction": {
+          "status": "success",
+          "response_ms": 6039.5,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 23,
+          "tokens_per_second": 10.82,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"action\": \"read_file\",\n  \"path\": \"README.md\"\n}\n```"
+        },
+        "project_summarization": {
+          "status": "success",
+          "response_ms": 11047.6,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 78,
+          "tokens_per_second": 11.12,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"summary\": \"The evidence provided indicates a Python-based application with an API implemented in `app/main.py`. There are also test files (`tests/test_api.py`) for the API, suggesting a testing framework is in use. The presence of SQLite suggests that the application likely interacts with a database, possibly for storing and retrieving data used by the API.\"\n}\n```"
+        },
+        "long_context": {
+          "status": "success",
+          "response_ms": 47318.9,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 12,
+          "tokens_per_second": 8.36,
+          "token_rate_measured": true,
+          "preview": "{\"marker\":\"LOCAL-CONTEXT-731\"}"
+        }
+      },
+      "note": "Controlled local prompts were run sequentially with keep_alive=0. Token rate uses runtime counts when available and otherwise a response-length estimate. Memory consumption was not measured."
+    },
+    {
+      "id": "d689f04c-f9f7-439c-bb00-fc451f8f3feb",
+      "model_id": "ollama-85462619ee721b466c5927d1",
+      "model_name": "embeddinggemma:latest",
+      "runtime": "ollama",
+      "results": {
+        "embedding": {
+          "status": "success",
+          "response_ms": 2561.3,
+          "dimensions": 768,
+          "vector_valid": true
+        },
+        "code_generation": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "code_explanation": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "requirement_analysis": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "planning": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "structured_output": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "tool_instruction": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "project_summarization": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "long_context": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        }
+      },
+      "note": "Controlled local prompts were run sequentially with keep_alive=0. Token rate uses runtime counts when available and otherwise a response-length estimate. Memory consumption was not measured."
+    },
+    {
+      "id": "40427227-e99f-4503-a85f-6d169625df45",
+      "model_id": "ollama-0a109f422b47e3a30ba2b10e",
+      "model_name": "nomic-embed-text:latest",
+      "runtime": "ollama",
+      "results": {
+        "embedding": {
+          "status": "success",
+          "response_ms": 1118.7,
+          "dimensions": 768,
+          "vector_valid": true
+        },
+        "code_generation": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "code_explanation": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "requirement_analysis": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "planning": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "structured_output": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "tool_instruction": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "project_summarization": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        },
+        "long_context": {
+          "status": "not_applicable",
+          "reason": "Embedding model; completion tasks were skipped."
+        }
+      },
+      "note": "Controlled local prompts were run sequentially with keep_alive=0. Token rate uses runtime counts when available and otherwise a response-length estimate. Memory consumption was not measured."
+    },
+    {
+      "id": "72a081d0-af24-4789-bd06-ad902ada1946",
+      "model_id": "ollama-dae161e27b0e90dd1856c8bb",
+      "model_name": "qwen2.5-coder:7b",
+      "runtime": "ollama",
+      "results": {
+        "embedding": {
+          "status": "not_applicable",
+          "reason": "Completion model; semantic embedding test is run for embedding-assigned models."
+        },
+        "code_generation": {
+          "status": "success",
+          "response_ms": 23503.4,
+          "json_valid": null,
+          "instruction_compliant": true,
+          "generated_tokens": 23,
+          "tokens_per_second": 5.0,
+          "token_rate_measured": true,
+          "preview": "```python\ndef clamp(value, low, high):\n    return max(low, min(value, high))\n```"
+        },
+        "code_explanation": {
+          "status": "success",
+          "response_ms": 20678.6,
+          "json_valid": null,
+          "instruction_compliant": true,
+          "generated_tokens": 44,
+          "tokens_per_second": 4.99,
+          "token_rate_measured": true,
+          "preview": "This Python expression is a list comprehension that iterates over each element `x` in the list `values`, and includes `x*x` in the resulting list only if `x` is greater than 0."
+        },
+        "requirement_analysis": {
+          "status": "success",
+          "response_ms": 36297.0,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 116,
+          "tokens_per_second": 4.68,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"objective\": \"Add a health endpoint to the application that returns a JSON status indicating the health of the service.\",\n  \"requirements\": {\n    \"endpoint\": {\n      \"path\": \"/health\",\n      \"method\": \"GET\"\n    },\n    \"response\": {\n      \"status\": {\n        \"type\": \"string\",\n        \"values\": [\"UP\", \"DOWN\"]\n      },\n      \"message\": {\n        \"type\": \"string\",\n        \"description\": \"A"
+        },
+        "planning": {
+          "status": "success",
+          "response_ms": 63123.9,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 245,
+          "tokens_per_second": 4.81,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"tasks\": [\n    {\n      \"task_id\": \"1\",\n      \"description\": \"Create a new health endpoint in the application codebase.\",\n      \"steps\": [\n        \"Identify the appropriate location in the codebase where the health endpoint should be added.\",\n        \"Create a new route or endpoint that will handle health checks.\",\n        \"Implement the logic to check the health of the application, suc"
+        },
+        "structured_output": {
+          "status": "success",
+          "response_ms": 15874.1,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 20,
+          "tokens_per_second": 5.09,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"valid\": true,\n  \"count\": 3\n}\n```"
+        },
+        "tool_instruction": {
+          "status": "success",
+          "response_ms": 16043.5,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 23,
+          "tokens_per_second": 4.8,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"action\": \"read_file\",\n  \"path\": \"README.md\"\n}\n```"
+        },
+        "project_summarization": {
+          "status": "success",
+          "response_ms": 24661.7,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 53,
+          "tokens_per_second": 4.48,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"summary\": \"The evidence indicates the presence of a Python API, with the main application code located in 'app/main.py' and tests for the API in 'tests/test_api.py'. The application uses an SQLite database.\"\n}\n```"
+        },
+        "long_context": {
+          "status": "failed",
+          "response_ms": 90028.2,
+          "json_valid": false,
+          "instruction_compliant": false,
+          "error": ""
+        }
+      },
+      "note": "Controlled local prompts were run sequentially with keep_alive=0. Token rate uses runtime counts when available and otherwise a response-length estimate. Memory consumption was not measured."
+    },
+    {
+      "id": "f85c4705-dc31-45f0-b2a5-12c28d3b6978",
+      "model_id": "ollama-845dbda0ea48ed749caafd9e",
+      "model_name": "qwen2.5:7b",
+      "runtime": "ollama",
+      "results": {
+        "embedding": {
+          "status": "not_applicable",
+          "reason": "Completion model; semantic embedding test is run for embedding-assigned models."
+        },
+        "code_generation": {
+          "status": "success",
+          "response_ms": 23544.3,
+          "json_valid": null,
+          "instruction_compliant": true,
+          "generated_tokens": 23,
+          "tokens_per_second": 5.03,
+          "token_rate_measured": true,
+          "preview": "```python\ndef clamp(value, low, high):\n    return max(low, min(value, high))\n```"
+        },
+        "code_explanation": {
+          "status": "success",
+          "response_ms": 16221.9,
+          "json_valid": null,
+          "instruction_compliant": true,
+          "generated_tokens": 21,
+          "tokens_per_second": 4.95,
+          "token_rate_measured": true,
+          "preview": "This Python expression generates a list of the squares of all positive numbers in the `values` list."
+        },
+        "requirement_analysis": {
+          "status": "success",
+          "response_ms": 80124.6,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 307,
+          "tokens_per_second": 4.52,
+          "token_rate_measured": true,
+          "preview": "Certainly! Below is a JSON object that outlines the objective and requirements for adding a health endpoint that returns JSON status:\n\n```json\n{\n  \"objective\": \"To implement a health endpoint that returns a JSON status indicating the health of the system.\",\n  \"requirements\": [\n    {\n      \"endpoint\": \"/health\",\n      \"method\": \"GET\",\n      \"description\": \"The endpoint should respond to GET request"
+        },
+        "planning": {
+          "status": "success",
+          "response_ms": 51322.7,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 173,
+          "tokens_per_second": 4.45,
+          "token_rate_measured": true,
+          "preview": "Certainly! Below is a JSON object with a `tasks` array containing two ordered implementation tasks for adding a health endpoint:\n\n```json\n{\n  \"tasks\": [\n    {\n      \"id\": 1,\n      \"description\": \"Define the health check endpoint path and HTTP method. For example, use '/health' with a GET request.\",\n      \"priority\": \"High\",\n      \"status\": \"Not Started\"\n    },\n    {\n      \"id\": 2,\n      \"descripti"
+        },
+        "structured_output": {
+          "status": "success",
+          "response_ms": 15576.7,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 16,
+          "tokens_per_second": 5.03,
+          "token_rate_measured": true,
+          "preview": "```json\n{\"valid\": true, \"count\": 3}\n```"
+        },
+        "tool_instruction": {
+          "status": "success",
+          "response_ms": 16128.0,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 23,
+          "tokens_per_second": 4.96,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"action\": \"read_file\",\n  \"path\": \"README.md\"\n}\n```"
+        },
+        "project_summarization": {
+          "status": "success",
+          "response_ms": 22238.8,
+          "json_valid": true,
+          "instruction_compliant": true,
+          "generated_tokens": 46,
+          "tokens_per_second": 4.62,
+          "token_rate_measured": true,
+          "preview": "```json\n{\n  \"summary\": \"The project includes a Python API with main logic in 'app/main.py', tests for the API in 'tests/test_api.py', and uses SQLite as the database system.\"\n}\n```"
+        },
+        "long_context": {
+          "status": "failed",
+          "response_ms": 90036.9,
+          "json_valid": false,
+          "instruction_compliant": false,
+          "error": ""
+        }
+      },
+      "note": "Controlled local prompts were run sequentially with keep_alive=0. Token rate uses runtime counts when available and otherwise a response-length estimate. Memory consumption was not measured."
+    }
+  ],
+  "hardware_context": {
+    "ram_gb": 16,
+    "cpu": "Intel Core i5-1340P",
+    "gpu": "integrated graphics"
+  },
+  "limitations": [
+    "Models were benchmarked sequentially; keep_alive=0 was requested to limit concurrent residency.",
+    "Ollama token counts and evaluation duration are used when supplied; fallback token rates are estimates.",
+    "Memory use and long production-context behavior were not measured.",
+    "The long-context case is a controlled short retrieval prompt, not a maximum-context test."
+  ]
+}

@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import Sidebar from "./components/sidebar/Sidebar";
 import ChatArea from "./components/chat/ChatArea";
@@ -8,7 +8,7 @@ import CodingWorkspace from "./components/coding/CodingWorkspace";
 import DocumentsWorkspace from "./components/documents/DocumentsWorkspace";
 import ModelsWorkspace from "./components/Models/ModelsWorkspace";
 
-import { chatApi } from "./services/api";
+import { agentApi, chatApi } from "./services/api";
 import type {
   Conversation,
   ChatMessage,
@@ -18,10 +18,14 @@ import type {
 
 import "./styles/main.css";
 import "./styles/projects.css";
+import "./styles/theme.css";
 
 type MainView = "chat" | "projects" | "coding" | "documents" | "models";
+type ApplicationModel = { id: string; name: string; runtime: string; roles: string[] };
 
 function App() {
+  const activeChatRequest = useRef<AbortController | null>(null);
+  const [theme, setTheme] = useState<"dark" | "light">(() => localStorage.getItem("las.theme") === "light" ? "light" : "dark");
   const [collapsed, setCollapsed] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [trash, setTrash] = useState<Conversation[]>([]);
@@ -35,8 +39,14 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [showTrash, setShowTrash] = useState(false);
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  const [applicationModels, setApplicationModels] = useState<ApplicationModel[]>([]);
   const [view, setView] = useState<MainView>("chat");
   const [projectRefreshKey, setProjectRefreshKey] = useState(0);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("las.theme", theme);
+  }, [theme]);
 
   const refreshChats = useCallback(async () => {
     try {
@@ -57,6 +67,12 @@ function App() {
   useEffect(() => {
     refreshChats();
     chatApi.getModel().then(setModelInfo).catch(() => setModelInfo(null));
+    agentApi.modelRoles().then(({ models, roles }) => setApplicationModels(models.map(model => ({
+      id: model.id,
+      name: model.name,
+      runtime: model.runtime,
+      roles: Object.entries(roles).filter(([, modelId]) => modelId === model.id).map(([role]) => role.replace(/_/g, " ")),
+    })))).catch(() => setApplicationModels([]));
   }, [refreshChats]);
 
   useEffect(() => {
@@ -139,6 +155,8 @@ function App() {
   async function sendMessage(content: string) {
     let conversationId = activeId;
     let temporaryAssistantId: string | null = null;
+    const controller = new AbortController();
+    activeChatRequest.current = controller;
 
     try {
       setError("");
@@ -169,6 +187,7 @@ function App() {
         conversation_id: currentConversationId,
         role: "assistant",
         content: "",
+        model_name: modelInfo?.name || modelInfo?.model_id || "Local model",
         created_at: new Date().toISOString(),
       };
 
@@ -188,7 +207,7 @@ function App() {
               : item
           )
         );
-      });
+      }, controller.signal);
 
       const [savedMessages, chatData, trashData] = await Promise.all([
         chatApi.getMessages(currentConversationId),
@@ -206,18 +225,16 @@ function App() {
 
       if (current) setActiveTitle(current.title);
     } catch (err) {
-      if (temporaryAssistantId) {
-        setMessages((previous) =>
-          previous.filter((item) => item.id !== temporaryAssistantId)
-        );
+      if (controller.signal.aborted) {
+        if (temporaryAssistantId) setMessages(previous => previous.filter(item => item.id !== temporaryAssistantId || Boolean(item.content)));
+      } else {
+        if (temporaryAssistantId) setMessages(previous => previous.filter(item => item.id !== temporaryAssistantId));
+        const message = err instanceof Error ? err.message : "Unable to generate response";
+        setError(message);
+        throw err;
       }
-
-      const message =
-        err instanceof Error ? err.message : "Unable to generate response";
-
-      setError(message);
-      throw err;
     } finally {
+      if (activeChatRequest.current === controller) activeChatRequest.current = null;
       setGenerating(false);
     }
   }
@@ -317,6 +334,8 @@ function App() {
   async function regenerateMessage(messageId: string) {
     if (!activeId || generating) return;
 
+    const controller = new AbortController();
+    activeChatRequest.current = controller;
     setError("");
     setGenerating(true);
 
@@ -335,16 +354,18 @@ function App() {
               : item
           )
         );
-      });
+      }, controller.signal);
 
       setMessages(await chatApi.getMessages(activeId));
       await refreshChats();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Regeneration failed");
-
-      const saved = await chatApi.getMessages(activeId).catch(() => messages);
-      setMessages(saved);
+      if (!controller.signal.aborted) {
+        setError(err instanceof Error ? err.message : "Regeneration failed");
+        const saved = await chatApi.getMessages(activeId).catch(() => messages);
+        setMessages(saved);
+      }
     } finally {
+      if (activeChatRequest.current === controller) activeChatRequest.current = null;
       setGenerating(false);
     }
   }
@@ -406,6 +427,8 @@ function App() {
     <div className="app-container">
       <Sidebar
         collapsed={collapsed}
+        theme={theme}
+        onToggleTheme={() => setTheme(value => value === "dark" ? "light" : "dark")}
         onToggle={() => setCollapsed((previous) => !previous)}
         onNewChat={createNewChat}
         conversations={conversations}
@@ -456,7 +479,7 @@ function App() {
       ) : view === "documents" ? (
         <DocumentsWorkspace onError={setError} onSuccess={setSuccess} />
       ) : view === "coding" ? (
-        <CodingWorkspace onError={setError} onSuccess={setSuccess} />
+        <CodingWorkspace theme={theme} onError={setError} onSuccess={setSuccess} />
       ) : view === "projects" ? (
         <ProjectsWorkspace
           refreshKey={projectRefreshKey}
@@ -473,7 +496,9 @@ function App() {
           onFeedback={updateFeedback}
           onRegenerate={regenerateMessage}
           onAddToProject={addResponseToProject}
-          modelName={modelInfo?.name || "Mistral · Local"}
+          modelName={modelInfo?.name || modelInfo?.model_id || "Local model"}
+          onStop={() => activeChatRequest.current?.abort()}
+          models={applicationModels}
           loading={loading}
           generating={generating}
           error={error}

@@ -1,5 +1,8 @@
 import json
+import ipaddress
 import httpx
+import codecs
+import signal
 
 from fastapi.responses import StreamingResponse, FileResponse
 import os
@@ -13,19 +16,28 @@ import re
 import sys
 import shutil
 import hashlib
+import logging
 import mimetypes
 import time
 from html.parser import HTMLParser
 
 from pathlib import Path
-from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 
 import pytesseract
+from app.agent import orchestrator as agent_orchestrator
+from app.agent import project_intelligence
+from app import testing_engine
+from app import coding_changes
+
+logger = logging.getLogger(__name__)
 
 # Tesseract OCR configuration
 TESSERACT_EXE = os.environ.get(
@@ -61,17 +73,21 @@ LLAMA_CPP_URL = os.environ.get(
     "LLAMA_CPP_URL",
     "http://127.0.0.1:8081"
 )
+CHAT_MODEL_PATH = Path(os.environ.get(
+    "LOCAL_AI_CHAT_MODEL",
+    r"D:\OllamaModels\blobs\sha256-5ee4f07cdb9beadbbb293e85803c569b01bd37ed059d2715faa7bb405f31caa6"
+))
+CHAT_MODEL_NAME = os.environ.get("LOCAL_AI_CHAT_MODEL_NAME", "qwen2.5:3b")
+CHAT_MODEL_PROCESS = None
+CHAT_MODEL_LOCK = threading.Lock()
 
-# Set this to the friendly name of the model currently loaded in llama.cpp.
-# Example: $env:LOCAL_AI_MODEL_NAME = "Mistral 7B"
-MODEL_NAME = os.environ.get("LOCAL_AI_MODEL_NAME", "Mistral")
 # --------------------------------------------------
 # CODING MODEL CONFIGURATION
 # --------------------------------------------------
 
 CODING_MODEL_PATH = Path(os.environ.get(
     "LOCAL_AI_CODING_MODEL",
-    r"D:\LOCAL-AI-STUDIO\models\coding\qwen2.5-coder-7b.gguf"
+    r"D:\OllamaModels\blobs\sha256-60e05f2100071479f596b964f89f510f057ce397ea22f2833a0cfe029bfc2463"
 ))
 
 LLAMA_SERVER_EXE = Path(os.environ.get(
@@ -84,7 +100,7 @@ CODING_LLAMA_URL = os.environ.get(
     "http://127.0.0.1:8082"
 )
 
-CODING_MODEL_NAME = "Qwen2.5-Coder 7B"
+CODING_MODEL_NAME = os.environ.get("LOCAL_AI_CODING_MODEL_NAME", "qwen2.3:coder7b")
 
 CODING_MODEL_PROCESS = None
 CODING_MODEL_LOCK = threading.Lock()
@@ -100,16 +116,28 @@ CODING_TERMINAL_TIMEOUT = 120
 CODING_TERMINAL_MAX_OUTPUT = 200_000
 CODING_DEBUG_SESSIONS = {}
 CODING_DEBUG_LOCK = threading.Lock()
+CODING_TERMINAL_PROPOSALS = {}
+CODING_TERMINAL_PROCESSES = {}
+CODING_TERMINAL_LOCK = threading.RLock()
+CODING_TERMINAL_HISTORY_LOCK = threading.Lock()
 
 def get_time():
     return datetime.now(timezone.utc).isoformat()
 
 
+@contextmanager
 def get_connection():
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 # --------------------------------------------------
@@ -622,7 +650,18 @@ class DocumentImportPath(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     initialize_storage()
-    yield
+    _recover_terminal_history()
+    _recover_testing_runs()
+    project_intelligence.initialize(DB_PATH)
+    agent_orchestrator.initialize(DB_PATH)
+    app.state.active_workspace = ACTIVE_CODING_WORKSPACE
+    app.state.data_root = DATA_ROOT
+    try:
+        yield
+    finally:
+        _shutdown_coding_terminal_processes()
+        await _stop_llama_runtime("chat")
+        await _stop_llama_runtime("coding")
 
 
 app = FastAPI(
@@ -632,18 +671,28 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+def _browser_cors_origins():
+    defaults = [
+        "http://localhost:1420", "http://127.0.0.1:1420",
+        "http://localhost:4173", "http://127.0.0.1:4173",
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "tauri://localhost", "http://tauri.localhost",
+    ]
+    configured = [origin.strip() for origin in os.environ.get("LOCAL_AI_CORS_ORIGINS", "").split(",") if origin.strip()]
+    return list(dict.fromkeys(defaults + configured))
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:1420",
-        "http://127.0.0.1:1420",
-        "tauri://localhost",
-        "http://tauri.localhost"
-    ],
+    allow_origins=_browser_cors_origins(),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+app.include_router(agent_orchestrator.router)
+app.include_router(agent_orchestrator.project_router)
 
 
 # --------------------------------------------------
@@ -1709,6 +1758,7 @@ async def stream_chat(
     async def generate():
 
         assistant_content = ""
+        used_model_name = CHAT_MODEL_NAME
 
         payload = {
             "messages": messages,
@@ -1793,7 +1843,7 @@ async def stream_chat(
                         conversation_id,
                         assistant_content,
                         get_time(),
-                        MODEL_NAME
+                        used_model_name
                     ))
 
                     db.execute("""
@@ -1881,7 +1931,33 @@ def select_coding_workspace(data: CodingWorkspaceSelect):
     if not selected.exists() or not selected.is_dir():
         raise HTTPException(400, "Please select an existing folder")
     ACTIVE_CODING_WORKSPACE = selected
+    app.state.active_workspace = selected
     return {"selected": True, "path": str(selected), "name": selected.name or str(selected)}
+
+
+@app.post("/coding/workspace/pick")
+def pick_coding_workspace(request: Request):
+    """Open a native folder picker for the browser UI on the local backend host."""
+    client_host = request.client.host if request.client else ""
+    try:
+        if not ipaddress.ip_address(client_host).is_loopback:
+            raise HTTPException(403, "The local folder picker is only available from this device")
+    except ValueError:
+        raise HTTPException(403, "The local folder picker is only available from this device")
+
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(parent=root, title="Select a project folder", mustexist=True)
+        root.destroy()
+    except Exception as error:
+        logger.exception("Unable to open the local project folder picker")
+        raise HTTPException(501, f"The operating system folder picker is unavailable: {error}")
+    return {"path": selected or None}
 
 
 @app.get("/coding/workspace")
@@ -2006,6 +2082,41 @@ class CodingTerminalRequest(BaseModel):
     approved: bool = False
     timeout: int = Field(default=30, ge=1, le=CODING_TERMINAL_TIMEOUT)
 
+class CodingTerminalPreview(BaseModel):
+    command: str = Field(min_length=1, max_length=4000)
+    relative_path: str = Field(default="", max_length=4096)
+    reason: str = Field(default="User requested terminal command", max_length=500)
+    session_id: str | None = Field(default=None, max_length=64)
+    timeout: int = Field(default=30, ge=0, le=CODING_TERMINAL_TIMEOUT)
+    interactive: bool = False
+
+    @model_validator(mode="after")
+    def unlimited_timeout_requires_interactive(self):
+        if self.timeout == 0 and not self.interactive:
+            raise ValueError("timeout=0 is allowed only for interactive terminal sessions")
+        return self
+
+class CodingTerminalInput(BaseModel):
+    input: str = Field(default="", max_length=65536)
+    eof: bool = False
+
+class CodingTestPrepareRequest(BaseModel):
+    suite_id: str = Field(min_length=1, max_length=200)
+    session_id: str | None = Field(default=None, max_length=64)
+    task_id: str | None = Field(default=None, max_length=64)
+    repair_of_run_id: str | None = Field(default=None, max_length=64)
+    timeout: int = Field(default=120, ge=1, le=CODING_TERMINAL_TIMEOUT)
+
+class CodingDebugFixRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+    model_id: str | None = Field(default=None, max_length=160)
+    task_id: str | None = Field(default=None, max_length=64)
+    unsaved_paths: list[str] = Field(default_factory=list, max_length=100)
+    max_attempts: int = Field(default=2, ge=1, le=5)
+
+class CodingTerminalExecute(BaseModel):
+    pass
+
 class CodingDebugStart(BaseModel):
     relative_path: str = Field(min_length=1, max_length=4096)
     approved: bool = False
@@ -2116,7 +2227,7 @@ async def current_model():
         pass
 
     return {
-        "name": MODEL_NAME,
+        "name": CHAT_MODEL_NAME,
         "model_id": model_id,
         "runtime": "llama.cpp",
         "available": model_id is not None
@@ -2134,135 +2245,158 @@ class CodingAssistantRequest(BaseModel):
     selection: str | None = Field(default=None, max_length=20000)
 
 
-async def coding_model_health():
+def _llama_runtime_config(role):
+    if role == "chat":
+        return {"role": role, "name": CHAT_MODEL_NAME, "model_path": CHAT_MODEL_PATH, "url": LLAMA_CPP_URL}
+    if role == "coding":
+        return {"role": role, "name": CODING_MODEL_NAME, "model_path": CODING_MODEL_PATH, "url": CODING_LLAMA_URL}
+    raise HTTPException(404, "Unknown managed llama.cpp model role")
+
+
+def _llama_runtime_process(role):
+    return CHAT_MODEL_PROCESS if role == "chat" else CODING_MODEL_PROCESS
+
+
+def _set_llama_runtime_process(role, process):
+    global CHAT_MODEL_PROCESS, CODING_MODEL_PROCESS
+    if role == "chat": CHAT_MODEL_PROCESS = process
+    elif role == "coding": CODING_MODEL_PROCESS = process
+
+
+async def _llama_runtime_health(role):
+    config = _llama_runtime_config(role)
+    model_id = None
+    reachable = False
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(f"{CODING_LLAMA_URL}/v1/models")
+            response = await client.get(f"{config['url']}/v1/models")
             if response.status_code == 200:
+                reachable = True
                 payload = response.json()
                 models = payload.get("data", [])
-                model_id = models[0].get("id") if models else None
-                return True, model_id
+                expected = os.path.normcase(os.path.normpath(str(config["model_path"])))
+                for model in models:
+                    candidate = str(model.get("id") or model.get("model") or "")
+                    if candidate and os.path.normcase(os.path.normpath(candidate)) == expected:
+                        model_id = candidate
+                        break
+                if model_id is None and models:
+                    model_id = str(models[0].get("id") or models[0].get("model") or "") or None
     except (httpx.RequestError, ValueError):
         pass
+    process = _llama_runtime_process(role)
+    process_running = process is not None and process.poll() is None
+    return {
+        "role": role,
+        "name": config["name"],
+        "available": bool(reachable and model_id and os.path.normcase(os.path.normpath(model_id)) == os.path.normcase(os.path.normpath(str(config["model_path"])))),
+        "reachable": reachable,
+        "process_running": process_running,
+        "managed_by_app": process_running,
+        "model_id": model_id,
+        "model_path": str(config["model_path"]),
+        "model_exists": config["model_path"].is_file(),
+        "runtime_url": config["url"],
+        "message": "Model is ready." if reachable and model_id and os.path.normcase(os.path.normpath(model_id)) == os.path.normcase(os.path.normpath(str(config["model_path"]))) else "The runtime is serving a different model." if reachable else "Model runtime is not responding."
+    }
 
-    return False, None
+
+async def coding_model_health():
+    status = await _llama_runtime_health("coding")
+    return status["available"], status["model_id"] if status["available"] else None
+
+
+async def chat_model_health():
+    status = await _llama_runtime_health("chat")
+    return status["available"], status["model_id"] if status["available"] else None
 
 
 @app.get("/coding/model/status")
 async def coding_model_status():
-    global CODING_MODEL_PROCESS
-
-    available, model_id = await coding_model_health()
-
-    process_running = (
-        CODING_MODEL_PROCESS is not None
-        and CODING_MODEL_PROCESS.poll() is None
-    )
-
-    return {
-        "available": available,
-        "process_running": available or process_running,
-        "model_id": model_id,
-        "model_path": str(CODING_MODEL_PATH),
-        "model_exists": CODING_MODEL_PATH.exists(),
-        "runtime_url": CODING_LLAMA_URL,
-        "message": (
-            "Coding model is ready."
-            if available
-            else "Coding model is not responding."
-        )
-    }
+    status = await _llama_runtime_health("coding")
+    status["process_running"] = status["available"] or status["process_running"]
+    return status
 
 
-@app.post("/coding/model/start")
-async def start_coding_model():
-    global CODING_MODEL_PROCESS
+@app.get("/models/managed-runtimes")
+async def managed_runtime_status():
+    return {"chat": await _llama_runtime_health("chat"), "coding": await _llama_runtime_health("coding")}
 
-    available, _ = await coding_model_health()
 
-    if available:
-        return {
-            "started": False,
-            "message": "Coding model is already running."
-        }
+async def _start_llama_runtime(role):
+    config = _llama_runtime_config(role)
+    status = await _llama_runtime_health(role)
+    if status["available"]:
+        return {"started": False, "available": True, "managed_by_app": status["managed_by_app"], "message": f"{config['name']} is already running."}
+    if status["reachable"]:
+        raise HTTPException(409, f"Port {config['url']} is serving a different model. Stop that runtime before loading {config['name']}.")
 
-    with CODING_MODEL_LOCK:
-        if CODING_MODEL_PROCESS is not None:
-            if CODING_MODEL_PROCESS.poll() is None:
-                return {
-                    "started": False,
-                    "message": "Coding model is already starting."
-                }
-            CODING_MODEL_PROCESS = None
-
-        if not LLAMA_SERVER_EXE.exists():
-            raise HTTPException(500, "llama-server.exe was not found.")
-
-        if not CODING_MODEL_PATH.exists():
-            raise HTTPException(404, "Coding GGUF model file was not found.")
-
+    lock = CHAT_MODEL_LOCK if role == "chat" else CODING_MODEL_LOCK
+    with lock:
+        process = _llama_runtime_process(role)
+        if process is not None:
+            if process.poll() is None:
+                return {"started": False, "available": False, "managed_by_app": True, "message": f"{config['name']} is starting."}
+            _set_llama_runtime_process(role, None)
+        if not LLAMA_SERVER_EXE.is_file():
+            raise HTTPException(500, f"llama-server.exe was not found at {LLAMA_SERVER_EXE}.")
+        if not config["model_path"].is_file():
+            raise HTTPException(404, f"{config['name']} model file was not found at {config['model_path']}.")
         try:
-            CODING_MODEL_PROCESS = subprocess.Popen(
-                [
-                    str(LLAMA_SERVER_EXE),
-                    "--model", str(CODING_MODEL_PATH),
-                    "--host", "127.0.0.1",
-                    "--port", "8082",
-                    "--ctx-size", "4096",
-                    "--threads", "4",
-                    "--n-gpu-layers", "0",
-                    "--parallel", "1"
-                ],
+            port = urlsplit(config["url"]).port or (8081 if role == "chat" else 8082)
+            process = subprocess.Popen(
+                [str(LLAMA_SERVER_EXE), "--model", str(config["model_path"]), "--host", "127.0.0.1", "--port", str(port), "--ctx-size", "4096", "--threads", "4", "--n-gpu-layers", "0", "--parallel", "1"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
+            _set_llama_runtime_process(role, process)
         except OSError as exc:
-            raise HTTPException(500, f"Unable to start coding model: {exc}")
+            raise HTTPException(500, f"Unable to start {config['name']}: {exc}") from exc
+    return {"started": True, "available": False, "managed_by_app": True, "message": f"{config['name']} is starting in the background."}
 
-    return {
-        "started": True,
-        "message": "Coding model server is starting."
-    }
+
+async def _stop_llama_runtime(role):
+    config = _llama_runtime_config(role)
+    lock = CHAT_MODEL_LOCK if role == "chat" else CODING_MODEL_LOCK
+    external_status = None
+    with lock:
+        process = _llama_runtime_process(role)
+        if process is None:
+            external_status = True
+        else:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            _set_llama_runtime_process(role, None)
+    if external_status:
+        status = await _llama_runtime_health(role)
+        return {"stopped": False, "message": f"{config['name']} was started outside Local AI Studio; it was left running." if status["reachable"] else f"{config['name']} is not running."}
+    return {"stopped": True, "message": f"{config['name']} stopped."}
+
+
+@app.post("/models/managed-runtimes/{role}/start")
+async def start_managed_runtime(role: str):
+    return await _start_llama_runtime(role)
+
+
+@app.post("/models/managed-runtimes/{role}/stop")
+async def stop_managed_runtime(role: str):
+    return await _stop_llama_runtime(role)
+
+
+@app.post("/coding/model/start")
+async def start_coding_model():
+    return await _start_llama_runtime("coding")
 
 
 @app.post("/coding/model/stop")
 async def stop_coding_model():
-    global CODING_MODEL_PROCESS
-
-    with CODING_MODEL_LOCK:
-        process = CODING_MODEL_PROCESS
-
-        if process is None:
-            available, _ = await coding_model_health()
-
-            if available:
-                return {
-                    "stopped": False,
-                    "message": "The model was started externally. Stop it using Ctrl+C in its PowerShell window."
-                }
-
-            return {
-                "stopped": False,
-                "message": "Coding model is not running."
-            }
-
-        if process.poll() is None:
-            process.terminate()
-
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-
-        CODING_MODEL_PROCESS = None
-
-    return {
-        "stopped": True,
-        "message": "Coding model stopped."
-    }
+    return await _stop_llama_runtime("coding")
 
 
 @app.post("/coding/assistant")
@@ -2556,6 +2690,7 @@ async def regenerate_assistant_response(
 
     async def generate():
         assistant_content = ""
+        used_model_name = CHAT_MODEL_NAME
         payload = {
             "messages": history,
             "temperature": data.temperature,
@@ -2604,7 +2739,7 @@ async def regenerate_assistant_response(
                     """, (
                         assistant_content,
                         get_time(),
-                        MODEL_NAME,
+                        used_model_name,
                         assistant_message_id,
                         conversation_id
                     ))
@@ -2700,37 +2835,699 @@ def read_version_row(version_id: str):
     return row
 
 
-@app.post("/coding/terminal/run")
-def run_coding_terminal(data: CodingTerminalRequest):
-    if not data.approved:
-        raise HTTPException(403, "Command execution requires explicit approval")
-    cwd = _workspace_cwd(data.relative_path)
-    command = data.command.strip()
-    # Block common destructive/system-wide operations. Project commands still require
-    # the user's explicit approval in the UI before this endpoint is called.
-    blocked = [r"(?i)\b(format|diskpart|shutdown|restart-computer|stop-computer)\b",
+def _terminal_redact(value: str) -> str:
+    value = re.sub(r"(?i)(password|passwd|token|api[_-]?key|secret)(\s*[:=]\s*)[^\s;]+", r"\1\2[REDACTED]", value)
+    value = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[REDACTED]", value)
+    return value[-CODING_TERMINAL_MAX_OUTPUT:]
+
+
+def _terminal_record(record: dict):
+    history_path = DATA_ROOT / "coding_terminal_history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    safe = {key: value for key, value in record.items() if key not in {"process", "job_handle", "lock", "input_lock", "input_queue", "input_writer", "monitor_thread"}}
+    with CODING_TERMINAL_HISTORY_LOCK:
+        with history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(safe, ensure_ascii=False) + "\n")
+
+
+def _recover_terminal_history():
+    history_path = DATA_ROOT / "coding_terminal_history.jsonl"
+    if not history_path.exists(): return
+    try:
+        rows = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError): return
+    latest = {}
+    for item in rows:
+        if item.get("execution_id"): latest[item["execution_id"]] = item
+    for execution_id, item in latest.items():
+        if item.get("status") == "running":
+            _terminal_record(item | {"status": "interrupted", "completed_at": datetime.now(timezone.utc).isoformat(),
+                                     "stderr": "\nBackend stopped before the command result was recorded."})
+
+
+def _terminal_blocked(command: str):
+    blocked = [r"(?i)\b(format|diskpart|shutdown|restart-computer|stop-computer|clear-disk|initialize-disk)\b",
               r"(?i)\b(remove-item|del|erase|rmdir|rd)\b[^\n]*(?:-recurse|/s|/q)",
-              r"(?i)\b(reg\s+(?:delete|add)|bcdedit|cipher\s+/w)\b"]
+              r"(?i)\b(reg\s+(?:delete|add)|bcdedit|cipher\s+/w|\bsc\s+delete)\b"]
     if any(re.search(pattern, command) for pattern in blocked):
         raise HTTPException(403, "This potentially destructive command is blocked by the IDE safety policy")
+
+
+def _terminal_session_event(session_id: str | None, event_type: str, message: str, data: dict):
+    if not session_id:
+        return
+    with agent_orchestrator.connect() as db:
+        session = db.execute("SELECT project_root FROM agent_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session or Path(session["project_root"]).resolve() != get_active_coding_workspace().resolve():
+            raise HTTPException(404, "Agent session does not belong to the selected project")
+        agent_orchestrator.event(db, session_id, event_type, message, data)
+
+
+def _terminal_job(process):
+    """Assign a kill-on-close Windows Job Object where the OS exposes it."""
+    if os.name != "nt":
+        return None
     try:
-        completed = subprocess.run(
-            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
-            cwd=str(cwd), capture_output=True, text=True, errors="replace",
-            timeout=data.timeout, shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        stdout = (completed.stdout or "")[-CODING_TERMINAL_MAX_OUTPUT:]
-        stderr = (completed.stderr or "")[-CODING_TERMINAL_MAX_OUTPUT:]
-        return {"exit_code": completed.returncode, "stdout": stdout, "stderr": stderr,
-                "timed_out": False, "working_directory": str(cwd)}
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return {"exit_code": None, "stdout": out[-CODING_TERMINAL_MAX_OUTPUT:],
-                "stderr": (err + "\nCommand timed out.")[-CODING_TERMINAL_MAX_OUTPUT:],
-                "timed_out": True, "working_directory": str(cwd)}
+        import ctypes
+        from ctypes import wintypes
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount", "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+        class BASIC_LIMIT(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD), ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+        class EXT_LIMIT(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BASIC_LIMIT), ("IoInfo", IO_COUNTERS), ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, wintypes.INT, wintypes.LPVOID, wintypes.DWORD]
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        job = kernel.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        limits = EXT_LIMIT()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            kernel.CloseHandle(job); return None
+        if not kernel.AssignProcessToJobObject(job, wintypes.HANDLE(int(process._handle))):
+            kernel.CloseHandle(job); return None
+        return job
+    except Exception:
+        return None
+
+
+def _terminal_terminate_job(job_handle, exit_code: int):
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateJobObject.restype = wintypes.BOOL
+    return bool(kernel.TerminateJobObject(job_handle, exit_code))
+
+
+def _terminal_close_job(job_handle):
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    return bool(kernel.CloseHandle(job_handle))
+
+
+def _terminal_snapshot(record: dict):
+    with record["lock"]:
+        return {"execution_id": record["id"], "status": record["status"], "command": record["command"],
+                "working_directory": record["working_directory"], "stdout": record["stdout"], "stderr": record["stderr"],
+                "exit_code": record["exit_code"], "started_at": record["started_at"], "completed_at": record["completed_at"],
+                "timed_out": record["status"] == "timed_out", "cancelled": record["status"] == "cancelled",
+                "interactive": record.get("interactive", False), "stdin_closed": record.get("stdin_closed", True)}
+
+
+def _terminal_incomplete_secret_start(text: str):
+    patterns = (
+        r"(?i)(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*[^\s;]*$",
+        r"(?i)(?:password|passwd|token|api[_-]?key|secret)\s*$",
+        r"(?i)bearer\s+[A-Za-z0-9._~+/-]*$",
+    )
+    starts = [match.start() for pattern in patterns if (match := re.search(pattern, text))]
+    if starts: return min(starts)
+    lower = text.casefold()
+    prefixes = ("password", "passwd", "token", "api_key", "api-key", "secret", "bearer")
+    for start in range(max(0, len(lower) - max(map(len, prefixes))), len(lower)):
+        suffix = lower[start:]
+        if any(prefix.startswith(suffix) for prefix in prefixes): return start
+    return None
+
+
+def _terminal_reader(record: dict, stream_name: str, pipe):
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    try:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk: break
+            pending += decoder.decode(chunk)
+            safe_end = len(pending)
+            secret_start = _terminal_incomplete_secret_start(pending)
+            if secret_start is not None: safe_end = min(safe_end, secret_start)
+            if safe_end:
+                safe = _terminal_redact(pending[:safe_end])
+                with record["lock"]:
+                    record[stream_name] = (record[stream_name] + safe)[-CODING_TERMINAL_MAX_OUTPUT:]
+                pending = pending[safe_end:]
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            pending += decoder.decode(b"", final=True)
+            if pending:
+                with record["lock"]:
+                    record[stream_name] = (record[stream_name] + _terminal_redact(pending))[-CODING_TERMINAL_MAX_OUTPUT:]
+        except (OSError, ValueError): pass
+        try: pipe.close()
+        except OSError: pass
+
+
+def _terminal_input_writer(record: dict):
+    stream = record.get("process").stdin
+    if stream is None: return
+    try:
+        while True:
+            item = record["input_queue"].get()
+            try:
+                if item is None: break
+                stream.write(item.encode("utf-8"))
+                stream.flush()
+            finally:
+                record["input_queue"].task_done()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        with record["lock"]: record["stdin_closed"] = True
+        try: stream.close()
+        except OSError: pass
+
+
+def _terminal_terminate_process_tree(record: dict, exit_code: int):
+    process = record["process"]
+    if process.poll() is not None: return
+    job = record.get("job_handle")
+    if job:
+        try:
+            if _terminal_terminate_job(job, exit_code): return
+        except Exception: pass
+    if os.name == "nt":
+        try:
+            result = subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+            if result.returncode == 0: return
+        except (OSError, subprocess.SubprocessError): pass
+        try: process.kill()
+        except OSError: pass
+    else:
+        try: os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            try: process.terminate()
+            except OSError: pass
+        try: process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                try: process.kill()
+                except OSError: pass
+
+
+def _shutdown_coding_terminal_processes():
+    with CODING_TERMINAL_LOCK:
+        records = list(CODING_TERMINAL_PROCESSES.values())
+    for record in records:
+        with record["lock"]:
+            if record["status"] not in {"running", "cancel_requested"}: continue
+            record["status"] = "cancel_requested"
+        _terminal_terminate_process_tree(record, 130)
+        try: record["process"].wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try: record["process"].kill()
+            except OSError: pass
+    for record in records:
+        monitor = record.get("monitor_thread")
+        if monitor and monitor is not threading.current_thread(): monitor.join(timeout=5)
+
+
+def _terminal_finish(record: dict):
+    process = record["process"]
+    try:
+        if record["timeout"] > 0: process.wait(timeout=record["timeout"])
+        else: process.wait()
+        final_status = "completed" if process.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        record["timed_out_flag"] = True
+        _terminal_terminate_process_tree(record, 124)
+        process.wait()
+        final_status = "timed_out"
+    if record.get("job_handle"):
+        try: _terminal_close_job(record["job_handle"])
+        except Exception: pass
+    for reader in record["readers"]: reader.join(timeout=3)
+    writer = record.get("input_writer")
+    if writer and writer.is_alive():
+        with record["input_lock"]:
+            with record["lock"]: record["stdin_closed"] = True
+            try: record["input_queue"].put_nowait(None)
+            except queue.Full: pass
+    if writer and writer is not threading.current_thread(): writer.join(timeout=1)
+    if process.stdin and not process.stdin.closed:
+        try: process.stdin.close()
+        except OSError: pass
+    with record["lock"]:
+        if record["status"] == "cancel_requested": final_status = "cancelled"
+        record["status"] = final_status
+        record["exit_code"] = process.returncode
+        record["completed_at"] = datetime.now(timezone.utc).isoformat()
+        if final_status == "timed_out": record["stderr"] = (record["stderr"] + "\nCommand timed out and was stopped.")[-CODING_TERMINAL_MAX_OUTPUT:]
+    _terminal_record(_terminal_snapshot(record) | {"reason": record["reason"], "session_id": record.get("session_id")})
+    _terminal_session_event(record.get("session_id"), "terminal_finished", f"Command {final_status}", {"execution_id": record["id"], "exit_code": record["exit_code"], "status": final_status,
+                              "stdout": record["stdout"][-5000:], "stderr": record["stderr"][-5000:]})
+
+
+@app.post("/coding/terminal/preview")
+def preview_coding_terminal(data: CodingTerminalPreview, request: Request = None):
+    command = data.command.strip()
+    if not command or any(ord(ch) < 32 and ch not in "\r\n\t" for ch in command):
+        raise HTTPException(400, "Enter a valid PowerShell command")
+    _terminal_blocked(command)
+    cwd = _workspace_cwd(data.relative_path)
+    root = get_active_coding_workspace().resolve()
+    if data.session_id:
+        if request is None: raise HTTPException(400, "An Agent session must be validated through the preview API")
+        session = agent_orchestrator.session_get(data.session_id, request)
+        if Path(session["project_root"]).resolve() != root: raise HTTPException(404, "Agent session does not belong to the selected project")
+        if session["status"] in {"paused", "cancelled"}: raise HTTPException(409, f"Agent session is {session['status']}")
+    proposal_id = str(uuid.uuid4())
+    network = bool(re.search(r"(?i)\b(install-module|invoke-webrequest|invoke-restmethod|curl|wget|git\s+(clone|fetch|pull)|pip\s+install|npm\s+(install|i)|yarn\s+add|pnpm\s+add)\b", command))
+    writes = bool(re.search(r"(?i)\b(set-content|add-content|out-file|new-item|copy-item|move-item|rename-item|pip\s+install|npm\s+(install|i)|git\s+(checkout|switch|reset)|compileall)\b", command))
+    if data.session_id:
+        _terminal_session_event(data.session_id, "terminal_command_proposed", "Agent proposed a PowerShell command for approval", {"proposal_id": proposal_id, "command": _terminal_redact(command), "relative_path": data.relative_path, "reason": data.reason})
+    proposal = {"id": proposal_id, "command": command, "relative_path": data.relative_path, "cwd": str(cwd), "root": str(root), "reason": data.reason.strip(), "session_id": data.session_id, "timeout": data.timeout, "interactive": data.interactive, "created_at": datetime.now(timezone.utc).isoformat()}
+    with CODING_TERMINAL_LOCK: CODING_TERMINAL_PROPOSALS[proposal_id] = proposal
+    return {"id": proposal_id, "command": _terminal_redact(command), "working_directory": str(cwd), "reason": data.reason.strip(), "timeout_seconds": data.timeout,
+            "may_modify_files": writes, "may_use_network": network, "approval_required": True, "session_id": data.session_id,
+            "interactive": data.interactive,
+            "warning": "PowerShell runs with this Windows account's permissions. The selected project is its working directory, not an OS sandbox."}
+
+
+@app.post("/coding/terminal/reject/{proposal_id}")
+def reject_coding_terminal_proposal(proposal_id: str):
+    with CODING_TERMINAL_LOCK:
+        proposal = CODING_TERMINAL_PROPOSALS.pop(proposal_id, None)
+    if not proposal: raise HTTPException(404, "Command proposal expired or was already used")
+    _terminal_session_event(proposal.get("session_id"), "terminal_command_rejected", "User rejected the proposed PowerShell command; nothing was executed", {"proposal_id": proposal_id, "command": _terminal_redact(proposal["command"])})
+    return {"id": proposal_id, "status": "rejected", "executed": False}
+
+
+@app.post("/coding/terminal/execute/{proposal_id}")
+def execute_coding_terminal(proposal_id: str):
+    with CODING_TERMINAL_LOCK:
+        proposal = CODING_TERMINAL_PROPOSALS.pop(proposal_id, None)
+    if not proposal: raise HTTPException(404, "Command proposal expired or was already used")
+    if proposal["timeout"] == 0 and not proposal.get("interactive"):
+        raise HTTPException(400, "An unlimited timeout is available only for approved interactive sessions")
+    if datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(proposal["created_at"]).timestamp() > 300:
+        raise HTTPException(410, "Command approval expired; review it again")
+    if str(get_active_coding_workspace().resolve()) != proposal["root"]:
+        raise HTTPException(409, "Selected project changed after command review")
+    cwd = _workspace_cwd(proposal["relative_path"])
+    if str(cwd) != proposal["cwd"]: raise HTTPException(409, "Working directory changed after command review")
+    args = ["powershell.exe", "-NoLogo", "-NoProfile"]
+    if not proposal.get("interactive"): args.append("-NonInteractive")
+    command = proposal["command"] + "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }"
+    args.extend(["-Command", command])
+    try:
+        process = subprocess.Popen(args, cwd=str(cwd), stdin=subprocess.PIPE if proposal.get("interactive") else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, shell=False,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                                   start_new_session=os.name != "nt")
     except OSError as exc:
-        raise HTTPException(500, f"Could not start terminal command: {exc}")
+        raise HTTPException(500, f"Could not start PowerShell: {exc}")
+    execution_id = str(uuid.uuid4())
+    record = {"id": execution_id, "command": _terminal_redact(proposal["command"]), "working_directory": str(cwd), "reason": proposal["reason"], "session_id": proposal["session_id"],
+              "timeout": proposal["timeout"], "process": process, "job_handle": _terminal_job(process), "status": "running", "exit_code": None,
+              "interactive": proposal.get("interactive", False), "stdin_closed": not proposal.get("interactive", False),
+              "input_queue": queue.Queue(maxsize=32), "input_lock": threading.Lock(), "input_writer": None, "monitor_thread": None,
+              "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None, "stdout": "", "stderr": "", "lock": threading.RLock(), "readers": [], "timed_out_flag": False}
+    with CODING_TERMINAL_LOCK: CODING_TERMINAL_PROCESSES[execution_id] = record
+    for stream_name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+        reader = threading.Thread(target=_terminal_reader, args=(record, stream_name, pipe), daemon=True)
+        record["readers"].append(reader); reader.start()
+    if proposal.get("interactive"):
+        record["input_writer"] = threading.Thread(target=_terminal_input_writer, args=(record,), daemon=True)
+        record["input_writer"].start()
+    record["monitor_thread"] = threading.Thread(target=_terminal_finish, args=(record,), daemon=True)
+    record["monitor_thread"].start()
+    _terminal_record({key: value for key, value in _terminal_snapshot(record).items() if key not in {"stdout", "stderr"}} | {"reason": proposal["reason"], "session_id": proposal["session_id"]})
+    _terminal_session_event(proposal["session_id"], "terminal_started", "Approved command started", {"execution_id": execution_id, "command": record["command"], "working_directory": str(cwd)})
+    return _terminal_snapshot(record)
+
+
+@app.post("/coding/terminal/executions/{execution_id}/input")
+def send_coding_terminal_input(execution_id: str, data: CodingTerminalInput):
+    with CODING_TERMINAL_LOCK: record = CODING_TERMINAL_PROCESSES.get(execution_id)
+    if not record: raise HTTPException(404, "Terminal execution not found")
+    if not record.get("interactive"): raise HTTPException(409, "This command was not started as an interactive session")
+    if not data.input and not data.eof: raise HTTPException(400, "Enter input or explicitly send EOF")
+    with record["input_lock"]:
+        with record["lock"]:
+            if record["status"] != "running": raise HTTPException(409, f"Terminal process is {record['status']}")
+            if record["stdin_closed"]: raise HTTPException(409, "Terminal input is already closed")
+        needed = int(bool(data.input)) + int(data.eof)
+        if record["input_queue"].qsize() + needed > record["input_queue"].maxsize:
+            raise HTTPException(429, "Terminal input queue is full; wait for the process to read pending input")
+        try:
+            if data.input: record["input_queue"].put_nowait(data.input)
+            if data.eof:
+                record["input_queue"].put_nowait(None)
+                with record["lock"]: record["stdin_closed"] = True
+        except queue.Full:
+            raise HTTPException(429, "Terminal input queue is full; wait for the process to read pending input")
+    return {"accepted": True, "eof": data.eof, "execution": _terminal_snapshot(record)}
+
+
+@app.get("/coding/terminal/executions")
+def list_coding_terminal_executions():
+    with CODING_TERMINAL_LOCK: records = list(CODING_TERMINAL_PROCESSES.values())
+    return [_terminal_snapshot(record) for record in sorted(records, key=lambda item: item["started_at"], reverse=True)]
+
+
+@app.get("/coding/terminal/executions/{execution_id}")
+def get_coding_terminal_execution(execution_id: str):
+    with CODING_TERMINAL_LOCK: record = CODING_TERMINAL_PROCESSES.get(execution_id)
+    if not record: raise HTTPException(404, "Terminal execution not found")
+    return _terminal_snapshot(record)
+
+
+@app.delete("/coding/terminal/executions/{execution_id}")
+def stop_coding_terminal_execution(execution_id: str):
+    with CODING_TERMINAL_LOCK: record = CODING_TERMINAL_PROCESSES.get(execution_id)
+    if not record: raise HTTPException(404, "Agent-owned terminal process not found")
+    with record["lock"]:
+        if record["status"] != "running": return _terminal_snapshot(record)
+        record["status"] = "cancel_requested"
+    _terminal_terminate_process_tree(record, 130)
+    return {"stopping": True, "execution_id": execution_id}
+
+
+@app.get("/coding/terminal/history")
+def coding_terminal_history():
+    history_path = DATA_ROOT / "coding_terminal_history.jsonl"
+    if not history_path.exists(): return []
+    rows = []
+    try:
+        for line in history_path.read_text(encoding="utf-8").splitlines()[-200:]:
+            try: rows.append(json.loads(line))
+            except json.JSONDecodeError: continue
+    except OSError: return []
+    return list(reversed(rows))
+
+
+def _testing_event(session_id: str | None, event_type: str, message: str, data: dict):
+    if session_id: _terminal_session_event(session_id, event_type, message, data)
+
+
+def _testing_task(session_id: str | None, task_id: str | None):
+    if not task_id: return
+    if not session_id: raise HTTPException(400, "An Agent task requires a linked session")
+    with agent_orchestrator.connect() as db:
+        row = db.execute("SELECT t.id FROM agent_tasks t JOIN agent_plans p ON p.id=t.plan_id WHERE t.id=? AND p.session_id=?", (task_id, session_id)).fetchone()
+    if not row: raise HTTPException(404, "Agent task does not belong to the selected session")
+
+
+def _testing_task_status(session_id: str | None, task_id: str | None, status: str, message: str, data: dict):
+    if not session_id or not task_id: return
+    with agent_orchestrator.connect() as db:
+        row = db.execute("SELECT t.id FROM agent_tasks t JOIN agent_plans p ON p.id=t.plan_id WHERE t.id=? AND p.session_id=?", (task_id, session_id)).fetchone()
+        if not row: return
+        db.execute("UPDATE agent_tasks SET status=? WHERE id=?", (status, task_id))
+        agent_orchestrator.event(db, session_id, "test_task_status", message, {"task_id": task_id, **data})
+
+
+def _testing_run_by_id(run_id: str, root: Path):
+    rows = testing_engine.history(DATA_ROOT, root=root, limit=200)
+    run = next((item for item in rows if item.get("id") == run_id), None)
+    if not run: raise HTTPException(404, "Test run was not found for this project")
+    return run
+
+
+def _recover_testing_runs():
+    terminal_rows = coding_terminal_history()
+    latest_terminal = {row.get("execution_id"): row for row in terminal_rows if row.get("execution_id")}
+    for run in testing_engine.history(DATA_ROOT, limit=200):
+        if run.get("status") != "running": continue
+        terminal = latest_terminal.get(run.get("execution_id"))
+        if terminal and terminal.get("status") == "interrupted":
+            testing_engine.update_run(DATA_ROOT, run["id"], status="interrupted", completed_at=terminal.get("completed_at"),
+                                      result={"status": "interrupted", "category": "test_environment", "message": "The application stopped before the test result was captured.", "counts": {}, "failed_tests": [], "stack_trace": "", "output": ""})
+
+
+@app.get("/coding/tests/discovery")
+def discover_coding_tests():
+    root = get_active_coding_workspace()
+    try: return testing_engine.discover(root)
+    except (OSError, ValueError) as exc: raise HTTPException(400, f"Could not inspect the selected project: {exc}") from exc
+
+
+@app.get("/coding/tests/history")
+def coding_test_history(limit: int = Query(default=50, ge=1, le=200)):
+    root = get_active_coding_workspace()
+    return testing_engine.history(DATA_ROOT, root=root, limit=limit)
+
+
+@app.get("/coding/tests/report")
+def coding_test_report(session_id: str | None = None):
+    root = get_active_coding_workspace()
+    rows = testing_engine.history(DATA_ROOT, root=root, limit=200)
+    if session_id:
+        _terminal_session_event(session_id, "test_report_viewed", "Final test report opened", {})
+        rows = [row for row in rows if row.get("session_id") == session_id]
+    completed = [row for row in rows if (row.get("result") or {}).get("status") in {"passed", "passed_with_skips", "failed", "error", "timed_out", "cancelled", "unparsed"}]
+    return {"project_root": str(root), "run_count": len(completed), "passed_runs": sum((row.get("result") or {}).get("status") == "passed" for row in completed),
+            "passed_with_skips_runs": sum((row.get("result") or {}).get("status") == "passed_with_skips" for row in completed),
+            "failed_runs": sum((row.get("result") or {}).get("status") == "failed" for row in completed),
+            "error_runs": sum((row.get("result") or {}).get("status") == "error" for row in completed), "runs": rows[:50],
+            "statement": "Only completed commands with verified result formats are counted as passed."}
+
+
+@app.post("/coding/tests/runs/prepare")
+def prepare_coding_test(data: CodingTestPrepareRequest, request: Request):
+    root = get_active_coding_workspace()
+    discovery = testing_engine.discover(root)
+    suite = next((item for item in discovery["suites"] if item["id"] == data.suite_id), None)
+    if not suite: raise HTTPException(404, "Test suite is not part of the current discovery results; refresh discovery")
+    if not suite["available"] or not suite["command"]:
+        raise HTTPException(409, suite.get("missing_reason") or "The selected test command is unavailable")
+    if data.task_id: _testing_task(data.session_id, data.task_id)
+    parent = _testing_run_by_id(data.repair_of_run_id, root) if data.repair_of_run_id else None
+    if parent and (parent.get("session_id") != data.session_id or parent.get("task_id") and parent.get("task_id") != data.task_id):
+        raise HTTPException(409, "A repair run must remain linked to the same Agent session and task")
+    if parent and (parent.get("status") != "completed" or (parent.get("result") or {}).get("status") not in {"failed", "error"}):
+        raise HTTPException(409, "Only a completed failed or errored run can be retested as a repair attempt")
+    root_run_id = (parent.get("repair_root_run_id") or parent["id"]) if parent else None
+    relative_path = suite.get("working_directory", "")
+    run_id = str(uuid.uuid4())
+    reason = f"Run discovered {suite['label']} command to verify the selected project"
+    try:
+        preview = preview_coding_terminal(CodingTerminalPreview(command=suite["command"], relative_path=relative_path, reason=reason,
+                                                               session_id=data.session_id, timeout=data.timeout), request)
+    except HTTPException: raise
+    item = {"id": run_id, "project_root": str(root), "suite": suite, "command": suite["command"], "working_directory": relative_path,
+            "session_id": data.session_id, "task_id": data.task_id, "repair_of_run_id": data.repair_of_run_id, "repair_root_run_id": root_run_id,
+            "preview_id": preview["id"], "execution_id": None, "status": "awaiting_approval", "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(), "result": None}
+    if parent and root_run_id:
+        root_run = _testing_run_by_id(root_run_id, root)
+        attempts = list(root_run.get("repair_attempts") or [])
+        if attempts and attempts[-1].get("run_id") == parent["id"]:
+            attempts[-1]["retest_run_id"] = run_id
+            testing_engine.update_run(DATA_ROOT, root_run_id, repair_attempts=attempts)
+    testing_engine.record(DATA_ROOT, item)
+    _testing_event(data.session_id, "test_run_prepared", f"Prepared {suite['label']} for approval", {"run_id": run_id, "task_id": data.task_id, "suite_id": suite["id"], "command": suite["command"]})
+    _testing_task_status(data.session_id, data.task_id, "waiting_for_approval", "Test command is waiting for user approval", {"run_id": run_id})
+    return {"run": item, "preview": preview}
+
+
+@app.post("/coding/tests/runs/{run_id}/reject")
+def reject_coding_test(run_id: str):
+    root = get_active_coding_workspace(); run = _testing_run_by_id(run_id, root)
+    if run.get("status") != "awaiting_approval": raise HTTPException(409, "This test command is no longer awaiting approval")
+    with CODING_TERMINAL_LOCK: CODING_TERMINAL_PROPOSALS.pop(run.get("preview_id"), None)
+    updated = testing_engine.update_run(DATA_ROOT, run_id, status="rejected", completed_at=datetime.now(timezone.utc).isoformat())
+    _testing_event(run.get("session_id"), "test_run_rejected", "User rejected the proposed test command", {"run_id": run_id, "task_id": run.get("task_id")})
+    _testing_task_status(run.get("session_id"), run.get("task_id"), "cancelled", "Test command rejected", {"run_id": run_id})
+    return updated
+
+
+@app.post("/coding/tests/runs/{run_id}/execute")
+def execute_coding_test(run_id: str):
+    root = get_active_coding_workspace(); run = _testing_run_by_id(run_id, root)
+    if run.get("status") != "awaiting_approval": raise HTTPException(409, "This test command is no longer awaiting approval")
+    if run.get("session_id"):
+        session = agent_orchestrator.get_session(run["session_id"])
+        if Path(session["project_root"]).resolve() != root: raise HTTPException(404, "Agent session does not belong to this project")
+        if session["status"] in {"paused", "cancelled"}: raise HTTPException(409, f"Agent session is {session['status']}")
+    try: started = execute_coding_terminal(run["preview_id"])
+    except HTTPException as exc:
+        testing_engine.update_run(DATA_ROOT, run_id, status="failed_to_start", error=str(exc.detail), completed_at=datetime.now(timezone.utc).isoformat())
+        raise
+    updated = testing_engine.update_run(DATA_ROOT, run_id, status="running", execution_id=started["execution_id"], started_at=started["started_at"])
+    _testing_event(run.get("session_id"), "test_run_started", f"Approved test command started: {run['suite']['label']}", {"run_id": run_id, "execution_id": started["execution_id"], "task_id": run.get("task_id")})
+    _testing_task_status(run.get("session_id"), run.get("task_id"), "in_progress", "Approved test run started", {"run_id": run_id})
+    return updated
+
+
+@app.get("/coding/tests/runs/{run_id}")
+async def get_coding_test_run(run_id: str):
+    root = get_active_coding_workspace(); run = _testing_run_by_id(run_id, root)
+    if run.get("status") != "running": return run
+    try: terminal = get_coding_terminal_execution(run["execution_id"])
+    except HTTPException:
+        recovered = next((row for row in coding_terminal_history() if row.get("execution_id") == run.get("execution_id")), None)
+        if not recovered or recovered.get("status") != "interrupted": return run
+        terminal = recovered | {"timed_out": False, "cancelled": False}
+    if terminal["status"] in {"running", "cancel_requested"}: return {**run, "terminal": terminal}
+    suite = run["suite"]
+    output = (terminal.get("stdout", "") + "\n" + terminal.get("stderr", ""))[-testing_engine.MAX_RUN_OUTPUT:]
+    result = await run_in_threadpool(testing_engine.classify, output, command=run["command"], suite_kind=suite["kind"],
+                                     exit_code=terminal.get("exit_code"), timed_out=terminal.get("timed_out", False), cancelled=terminal.get("cancelled", False))
+    if result.get("location"):
+        relative = testing_engine._inside(root, Path(result["location"]["path"]))
+        result["location"]["path"] = relative if relative else ""
+        if not relative: result["location"] = None
+    if result["status"] in {"failed", "timed_out"}:
+        result["related_context"] = await run_in_threadpool(testing_engine.related_context, root, result)
+        result["source_locations"] = [item["path"] for item in result["related_context"]]
+    duration = None
+    try: duration = max(0, (datetime.fromisoformat(terminal["completed_at"]) - datetime.fromisoformat(terminal["started_at"])).total_seconds())
+    except (ValueError, TypeError): pass
+    updated = testing_engine.update_run(DATA_ROOT, run_id, status="completed", completed_at=terminal.get("completed_at"), duration_seconds=duration, result=result)
+    _testing_event(run.get("session_id"), "test_run_completed", f"{suite['label']} result: {result['status']}", {"run_id": run_id, "task_id": run.get("task_id"), "status": result["status"], "category": result["category"], "exit_code": terminal.get("exit_code"), "duration_seconds": duration})
+    task_status = "completed" if result["status"] == "passed" else "failed" if result["status"] in {"failed", "timed_out"} else "blocked" if result["status"] == "unparsed" else "cancelled"
+    _testing_task_status(run.get("session_id"), run.get("task_id"), task_status, f"Test task {task_status}", {"run_id": run_id, "result_status": result["status"]})
+    return updated
+
+
+@app.delete("/coding/tests/runs/{run_id}")
+def cancel_coding_test(run_id: str):
+    root = get_active_coding_workspace(); run = _testing_run_by_id(run_id, root)
+    if run.get("status") == "awaiting_approval": return reject_coding_test(run_id)
+    if run.get("status") != "running": raise HTTPException(409, "Only a pending or running test command can be cancelled")
+    stop_coding_terminal_execution(run["execution_id"])
+    _testing_event(run.get("session_id"), "test_run_cancelled", "User requested test run cancellation", {"run_id": run_id, "task_id": run.get("task_id")})
+    return {"id": run_id, "status": "cancelling"}
+
+
+@app.post("/agent/sessions/{session_id}/debug/fix")
+async def propose_debug_fix(session_id: str, data: CodingDebugFixRequest, request: Request):
+    session = agent_orchestrator.session_get(session_id, request)
+    if session["mode"] != "planning" or session["status"] != "plan_approved" or session.get("plan_status") != "approved":
+        raise HTTPException(409, "Debug fixes require an approved planning session")
+    root = get_active_coding_workspace()
+    run = _testing_run_by_id(data.run_id, root)
+    if run.get("session_id") != session_id: raise HTTPException(404, "Test run is not linked to this Agent session")
+    failure = run.get("result") or {}
+    if run.get("status") != "completed" or failure.get("status") not in {"failed", "error"}:
+        raise HTTPException(409, "Only a completed failed or errored test run can be diagnosed")
+    if failure.get("status") == "error" and failure.get("category") not in {"syntax_error", "import_error", "type_error", "runtime_exception"}:
+        message = failure.get("category_message") or "The test process failed before tests could run"
+        diagnosis = {"root_cause": message, "confidence": 1.0, "alternatives": [], "evidence": [], "uncertainty": "Resolve the test environment or dependency issue, then rerun the suite."}
+        testing_engine.update_run(DATA_ROOT, run["id"], diagnosis=diagnosis, repair_state="stopped_test_not_executed")
+        _testing_event(session_id, "debug_environment_issue", message, {"run_id": run["id"], "category": failure.get("category"), "task_id": data.task_id or run.get("task_id")})
+        return {"diagnosis": diagnosis, "changeset": None, "repair_stopped": True, "reason": diagnosis["uncertainty"]}
+    root_run_id = run.get("repair_root_run_id") or run["id"]
+    root_run = _testing_run_by_id(root_run_id, root)
+    attempts = list(root_run.get("repair_attempts") or [])
+    signature = testing_engine.failure_signature(failure)
+    repair_limit = int(attempts[0].get("max_attempts", data.max_attempts)) if attempts else data.max_attempts
+    stop_reason = testing_engine.repair_stop_reason(failure, attempts, repair_limit)
+    if stop_reason == "attempt_limit":
+        raise HTTPException(409, f"The repair attempt limit ({repair_limit}) was reached; review the failure manually")
+    if stop_reason == "repeated_failure":
+        testing_engine.update_run(DATA_ROOT, run["id"], repair_state="stopped_repeated_failure")
+        _testing_event(session_id, "debug_repair_stopped", "Stopped because the same test failure repeated after an approved repair", {"run_id": run["id"], "repair_root_run_id": root_run_id, "attempts": len(attempts)})
+        raise HTTPException(409, "The same failure repeated after a repair; stopping the repair loop")
+    task_id = data.task_id or run.get("task_id")
+    if task_id: _testing_task(session_id, task_id)
+    evidence = await run_in_threadpool(testing_engine.related_context, root, failure)
+    if not evidence:
+        testing_engine.update_run(DATA_ROOT, run["id"], repair_state="stopped_insufficient_evidence")
+        _testing_event(session_id, "debug_repair_stopped", "Insufficient project source evidence to propose a safe fix", {"run_id": run["id"]})
+        return {"diagnosis": {"root_cause": "Insufficient retrieved source evidence", "confidence": 0, "alternatives": [], "evidence": []}, "changeset": None, "repair_stopped": True}
+    try:
+        with agent_orchestrator.connect() as db:
+            coding_role = db.execute("SELECT model_id FROM model_capability_assignments WHERE capability='coding'").fetchone()
+            model_id = data.model_id or (coding_role[0] if coding_role else None) or session.get("model_id")
+            model, endpoint = agent_orchestrator._selected_model(db, model_id)
+        plan = agent_orchestrator.read_plan(session_id, request)
+        allowed_task_ids = {task["id"] for task in agent_orchestrator.get_tasks(session_id)}
+        prompt = (
+            "Diagnose this actual completed local test failure using only the supplied source evidence. "
+            "Return one JSON object with diagnosis {root_cause, confidence (0..1), alternatives (array), evidence_paths (array), uncertainty (string)} "
+            "and changes (array). Each change must be create or modify with project-relative path, complete content, summary, task_ids. "
+            "The operation value must be exactly the lowercase word create or modify. Example change object: "
+            "{\"operation\":\"modify\",\"path\":\"relative/file.py\",\"content\":\"complete file content\",\"summary\":\"reason\",\"task_ids\":[]}. "
+            "Do not propose deletes, renames, dependencies, commands, or edits unsupported by the evidence. "
+            "If the cause is uncertain or evidence is inadequate, return changes=[] and explain uncertainty.\n"
+            "APPROVED PLAN TASKS:\n" + json.dumps(plan.get("plan", {}).get("tasks", []), ensure_ascii=False)[:5000] +
+            "\nACTUAL TEST FAILURE:\n" + json.dumps({key: failure.get(key) for key in ("category", "message", "failed_tests", "location", "stack_trace", "output")}, ensure_ascii=False)[:10000] +
+            "\nRETRIEVED PROJECT SOURCE EVIDENCE:\n" + json.dumps(evidence, ensure_ascii=False)[:12000]
+        )
+        raw = await agent_orchestrator._complete(model, endpoint, prompt, profile="coding")
+        payload = agent_orchestrator._parse_json(raw)
+        diagnosis = payload.get("diagnosis") if isinstance(payload, dict) else None
+        changes = payload.get("changes") if isinstance(payload, dict) else None
+        if not isinstance(diagnosis, dict): raise ValueError("The local model did not return a structured diagnosis")
+        try: confidence = max(0.0, min(1.0, float(diagnosis.get("confidence", 0))))
+        except (TypeError, ValueError): confidence = 0.0
+        diagnosis["confidence"] = confidence
+        diagnosis["evidence"] = [{"path": item["path"], "line_start": item["line_start"], "line_end": item["line_end"], "excerpt": item["excerpt"]} for item in evidence]
+        if confidence < 0.55 or not isinstance(changes, list) or not changes:
+            testing_engine.update_run(DATA_ROOT, run["id"], diagnosis=diagnosis, repair_state="stopped_uncertain")
+            _testing_event(session_id, "debug_diagnosis_uncertain", "The coding model could not support a sufficiently confident correction", {"run_id": run["id"], "confidence": confidence, "category": failure.get("category")})
+            return {"diagnosis": diagnosis, "changeset": None, "repair_stopped": True, "reason": diagnosis.get("uncertainty") or "No supported correction was returned"}
+        if len(changes) > 12: raise ValueError("The repair proposal exceeds the 12-file review limit")
+        operation_aliases = {"update": "modify", "edit": "modify", "replace": "modify", "add": "create", "new": "create",
+                             "update_file": "modify", "edit_file": "modify", "modify_file": "modify", "replace_file": "modify",
+                             "add_file": "create", "new_file": "create", "create_file": "create"}
+        for change in changes:
+            if isinstance(change, dict):
+                operation = str(change.get("operation", "")).strip().casefold().replace(" ", "_")
+                normalized = operation_aliases.get(operation, operation)
+                if normalized == operation:
+                    if operation.startswith(("modify", "edit", "update", "replace")): normalized = "modify"
+                    elif operation.startswith(("create", "add", "new")): normalized = "create"
+                change["operation"] = normalized
+            if not isinstance(change, dict) or change.get("operation") not in {"create", "modify"}:
+                raise ValueError("Debug fixes may only create or modify files")
+            if not isinstance(change.get("path"), str) or not isinstance(change.get("content"), str):
+                raise ValueError("Every debug fix must include a relative path and complete file content")
+            change["task_ids"] = [task for task in change.get("task_ids", []) if task in allowed_task_ids] if isinstance(change.get("task_ids", []), list) else []
+        changeset = await run_in_threadpool(coding_changes.prepare, root, changes, agent_orchestrator._change_storage(request), session_id=session_id, unsaved_paths=data.unsaved_paths)
+    except HTTPException: raise
+    except (ValueError, json.JSONDecodeError) as exc: raise HTTPException(422, f"Debug fix proposal was rejected: {exc}") from exc
+    except agent_orchestrator.InferenceFailure as exc: raise HTTPException(502, f"Local coding diagnosis failed [{exc.category}]: {exc.detail}") from exc
+    except Exception as exc:
+        logger.exception("Debug fix generation failed", extra={"session_id": session_id, "run_id": data.run_id})
+        raise HTTPException(502, "Local debugging model failed. Check the selected local coding model and retry.") from exc
+    attempt = {"run_id": run["id"], "failure_signature": signature, "changeset_id": changeset["id"], "created_at": datetime.now(timezone.utc).isoformat(), "confidence": confidence, "max_attempts": repair_limit}
+    root_updated = testing_engine.update_run(DATA_ROOT, root_run_id, repair_attempts=attempts + [attempt], last_fix_changeset_id=changeset["id"])
+    updated = run if run["id"] == root_run_id else testing_engine.update_run(DATA_ROOT, run["id"], diagnosis=diagnosis, repair_state="fix_awaiting_review", fix_changeset_id=changeset["id"])
+    if run["id"] == root_run_id:
+        updated = testing_engine.update_run(DATA_ROOT, run["id"], diagnosis=diagnosis, repair_state="fix_awaiting_review", fix_changeset_id=changeset["id"])
+    with agent_orchestrator.connect() as db:
+        agent_orchestrator.event(db, session_id, "debug_fix_proposed", "A correction changeset is ready for file-by-file review", {"run_id": run["id"], "repair_root_run_id": root_run_id, "changeset_id": changeset["id"], "attempt": len(attempts)+1, "task_id": task_id, "confidence": confidence})
+    _testing_task_status(session_id, task_id, "waiting_for_approval", "Debug correction is waiting for review", {"run_id": run["id"], "changeset_id": changeset["id"]})
+    return {"diagnosis": diagnosis, "changeset": changeset, "repair_attempt": len(attempts)+1, "repair_attempts_remaining": max(0, repair_limit-len(attempts)-1), "run": updated, "repair_stopped": False}
+
+
+@app.post("/coding/terminal/run")
+def run_coding_terminal(data: CodingTerminalRequest):
+    # Compatibility endpoint: the request's affirmative flag is an explicit approval
+    # of this exact command; the desktop uses the immutable preview/execute workflow.
+    if not data.approved: raise HTTPException(403, "Command execution requires explicit approval")
+    preview = preview_coding_terminal(CodingTerminalPreview(command=data.command, relative_path=data.relative_path, reason="Legacy terminal request", timeout=data.timeout))
+    execution = execute_coding_terminal(preview["id"])
+    deadline = time.monotonic() + data.timeout + 5
+    while time.monotonic() < deadline:
+        result = get_coding_terminal_execution(execution["execution_id"])
+        if result["status"] != "running":
+            return {"exit_code": result["exit_code"], "stdout": result["stdout"], "stderr": result["stderr"], "timed_out": result["timed_out"], "working_directory": result["working_directory"]}
+        time.sleep(.1)
+    stop_coding_terminal_execution(execution["execution_id"])
+    raise HTTPException(504, "Terminal command did not stop within its timeout")
 
 
 @app.post("/coding/tests/run")
@@ -2748,10 +3545,14 @@ def run_coding_tests(data: CodingTerminalRequest):
         completed = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True,
                                    errors="replace", timeout=data.timeout, shell=False,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return {"exit_code": completed.returncode, "stdout": (completed.stdout or "")[-CODING_TERMINAL_MAX_OUTPUT:],
-                "stderr": (completed.stderr or "")[-CODING_TERMINAL_MAX_OUTPUT:], "timed_out": False}
+        result = {"exit_code": completed.returncode, "stdout": _terminal_redact(completed.stdout or ""),
+                  "stderr": _terminal_redact(completed.stderr or ""), "timed_out": False}
+        _terminal_record({"execution_id": str(uuid.uuid4()), "command": command, "working_directory": str(cwd),
+                          "status": "completed" if completed.returncode == 0 else "failed", "started_at": datetime.now(timezone.utc).isoformat(),
+                          "completed_at": datetime.now(timezone.utc).isoformat(), "exit_code": completed.returncode, "reason": "Approved test run"})
+        return result
     except subprocess.TimeoutExpired as exc:
-        return {"exit_code": None, "stdout": str(exc.stdout or ""),
+        return {"exit_code": None, "stdout": _terminal_redact(str(exc.stdout or "")),
                 "stderr": "Test run timed out.", "timed_out": True}
 
 

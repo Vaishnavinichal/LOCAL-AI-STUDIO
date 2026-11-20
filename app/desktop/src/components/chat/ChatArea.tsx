@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Sparkles, Paperclip, ArrowUp, ChevronDown, User, Bot, LoaderCircle,
-  Copy, RefreshCw, Share2, FolderPlus, ThumbsUp, ThumbsDown, Check
+  Copy, RefreshCw, Share2, FolderPlus, ThumbsUp, ThumbsDown, Check, Square
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -17,7 +17,9 @@ interface ChatAreaProps {
   onFeedback: (messageId: string, rating: "good" | "bad" | null) => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
   onAddToProject: (messageId: string) => Promise<void>;
+  onStop: () => void;
   modelName: string;
+  models: Array<{ id: string; name: string; runtime: string; roles: string[] }>;
   loading: boolean;
   generating: boolean;
   error: string;
@@ -28,12 +30,13 @@ function formatTimestamp(value: string) {
 }
 
 export default function ChatArea({
-  title, messages, onSend, onFeedback, onRegenerate, onAddToProject,
-  modelName, loading, generating, error
+  title, messages, onSend, onFeedback, onRegenerate, onAddToProject, onStop,
+  modelName, models, loading, generating, error
 }: ChatAreaProps) {
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -84,9 +87,18 @@ export default function ChatArea({
     <main className="chat-area">
       <header className="topbar">
         <span className="topbar-title">{title}</span>
-        <button className="model-selector" type="button" disabled title="Currently loaded local model">
-          <Sparkles size={16} /> {modelName || "Local model"} <ChevronDown size={15} />
-        </button>
+        <div className="chat-model-menu">
+          <button className="model-selector" type="button" aria-expanded={modelMenuOpen} aria-label="Show application models" onClick={()=>setModelMenuOpen(value=>!value)}>
+            <Sparkles size={16} /> {modelName || "Local model"} <ChevronDown size={15} />
+          </button>
+          {modelMenuOpen&&<div className="chat-model-menu-panel" role="dialog" aria-label="Models used by LOCAL AI STUDIO">
+            <strong>Application models</strong>
+            <small>The current chat uses {modelName || "the configured local model"}.</small>
+            {modelName&&!models.some(model=>model.name===modelName)&&<div className="chat-model-option"><span><b>{modelName}</b><small>Current default chat model</small></span><i>Chat default</i></div>}
+            {models.map(model=><div className="chat-model-option" key={model.id}><span><b>{model.name}</b><small>{model.runtime}{model.roles.length?` · ${model.roles.join(", ")}`:" · available to the application"}</small></span>{model.name===modelName&&<i>Chat default</i>}</div>)}
+            {models.length===0&&<p className="chat-model-empty">No installed application models were found.</p>}
+          </div>}
+        </div>
       </header>
       <section className="chat-content">
         {messages.length === 0 && !loading ? (
@@ -100,13 +112,14 @@ export default function ChatArea({
             {messages.map(item => {
               const isUser = item.role === "user";
               const pending = generating && item.role === "assistant" && item.id.startsWith("local-assistant-") && !item.content;
+              const responseModel = item.model_name && !/^mistral$/i.test(item.model_name) ? item.model_name : modelName;
               return (
                 <article className={`message-row ${item.role}`} key={item.id}>
                   <div className="message-avatar">{isUser ? <User size={17} /> : <Bot size={17} />}</div>
                   <div className="message-body">
                     <div className="message-heading">
                       <strong>{isUser ? "You" : "Assistant"}</strong>
-                      {!isUser && <span className="message-model"><Sparkles size={12} /> {item.model_name || modelName || "Local model"}</span>}
+                      {!isUser && <span className="message-model"><Sparkles size={12} /> {responseModel || "Local model"}</span>}
                     </div>
                     {pending ? <span className="generating-indicator"><LoaderCircle size={15} className="spinner" /> Thinking...</span> :
                       <div className="message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{item.content}</ReactMarkdown></div>}
@@ -150,9 +163,9 @@ export default function ChatArea({
               placeholder="Message Local AI Studio..." rows={2} disabled={busy}/>
             <div className="composer-actions">
               <button className="attachment-button" type="button" title="Attachments (coming soon)" disabled><Paperclip size={19}/></button>
-              <button className="send-button" type="button" disabled={!message.trim() || busy} onClick={handleSend}>
-                {busy ? <LoaderCircle size={18} className="spinner"/> : <ArrowUp size={19}/>}
-              </button>
+              {generating
+                ? <button className="send-button stop-chat-button" type="button" onClick={onStop} aria-label="Stop response" title="Stop response"><Square size={16}/></button>
+                : <button className="send-button" type="button" disabled={!message.trim() || busy} onClick={handleSend}>{busy ? <LoaderCircle size={18} className="spinner"/> : <ArrowUp size={19}/>}</button>}
             </div>
           </div>
           <p className="composer-note">{generating ? `${modelName || "Local model"} is generating...` : "Your messages and AI responses are stored locally."}</p>

@@ -888,6 +888,12 @@ button {
   cursor: not-allowed;
 }
 
+.stop-chat-button {
+  background: #a84f56;
+  color: #fff;
+}
+.stop-chat-button:hover { background: #923f46; }
+
 .composer-note {
   text-align: center;
   color: #777;
